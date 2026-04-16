@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# Idempotent Nomad Bootstrap Script for Debian-based Systems
+
 # --- Configuration ---
 # You can override these by passing environment variables
 NOMAD_VERSION="${NOMAD_VERSION:-latest}"
@@ -66,16 +68,8 @@ ensure_pkg() {
     fi
 }
 
-main() {
-    # 1. Privilege Check & Self-Sudo
-    if ! is_root; then
-        log "Not running as root. Attempting to escalate via sudo..."
-        exec sudo -E "$0" "$@"
-    fi
-
-    log "Starting Nomad bootstrap process..."
-
-    # 2. Bootstrap core dependencies
+install() {
+    # Bootstrap core dependencies
     # We install these first to ensure we can handle keys and repo management
     log "Checking core system dependencies..."
     apt-get update -qq
@@ -83,7 +77,7 @@ main() {
         ensure_pkg "$pkg"
     done
 
-    # 3. Setup HashiCorp GPG Keyring
+    # Setup HashiCorp GPG Keyring
     if [[ ! -f "$HASHICORP_KEYRING" ]]; then
         log "Adding HashiCorp GPG keyring..."
         # Ensure directory exists
@@ -92,7 +86,7 @@ main() {
         chmod 644 "$HASHICORP_KEYRING"
     fi
 
-    # 4. Setup HashiCorp Repository
+    # Setup HashiCorp Repository
     if [[ ! -f "$HASHICORP_SOURCES_FILE" ]]; then
         local codename
         codename=$(get_debian_codename)
@@ -100,7 +94,7 @@ main() {
         echo "deb [signed-by=$HASHICORP_KEYRING] https://apt.releases.hashicorp.com $codename main" > "/etc/apt/$HASHICORP_SOURCES_FILE"
     fi
 
-    # 5. Install Nomad
+    # Install Nomad
     # We must update again to pick up the new HashiCorp repo
     log "Updating package lists with HashiCorp repository..."
     apt-get update -qq -o Dir::Etc::sourcelist="$HASHICORP_SOURCES_FILE" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0"
@@ -121,7 +115,7 @@ main() {
         apt-get install -y -qq "nomad=${NOMAD_VERSION##latest}*"
     fi
 
-    # 6. Final Verification
+    # Final Verification
     if is_cmd_available nomad; then
         local version
         version=$(nomad version | head -n 1)
@@ -129,6 +123,18 @@ main() {
     else
         error "Nomad installation failed verification."
     fi
+}
+
+main() {
+    # Privilege Check & Self-Sudo
+    if ! is_root; then
+        log "Not running as root. Attempting to escalate via sudo..."
+        exec sudo -E "$0" "$@"
+    fi
+
+    log "Starting Nomad bootstrap process..."
+
+    install
 }
 
 main "$@"
