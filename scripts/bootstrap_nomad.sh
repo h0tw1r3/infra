@@ -4,7 +4,7 @@
 # You can override these by passing environment variables
 NOMAD_VERSION="${NOMAD_VERSION:-latest}"
 HASHICORP_KEYRING="/usr/share/keyrings/hashicorp-archive-keyring.gpg"
-HASHICORP_SOURCES="/etc/apt/sources.list.d/hashicorp.list"
+HASHICORP_SOURCES_FILE="sources.list.d/hashicorp.list"
 
 # --- Safety & Robustness ---
 set -euo pipefail
@@ -34,6 +34,10 @@ is_cmd_available() {
     command -v "$1" >/dev/null 2>&1
 }
 
+pkg_version() {
+    dpkg-query -W -f='${source:Upstream-Version}\n' "$1"
+}
+
 get_debian_codename() {
     # Pull codename directly from os-release to avoid dependency on lsb-release
     if [[ -f /etc/os-release ]]; then
@@ -46,24 +50,30 @@ get_debian_codename() {
 
 # --- Main Logic ---
 
+ensure_pkg_need_apt_update=1
 ensure_pkg() {
     local pkg="$1"
+    local do_apt_update="${2:-$ensure_pkg_need_apt_update}"
+
     if ! is_pkg_installed "$pkg"; then
+        if [[ "$do_apt_update" -eq 1 ]]; then
+            log "Updating package lists before installing $pkg..."
+            apt-get update -qq
+            ensure_pkg_need_apt_update=0
+        fi
         log "Installing package: $pkg"
         apt-get install -y -qq "$pkg"
-    else
-        log "Package already present: $pkg"
     fi
 }
 
 main() {
-    log "Starting Nomad bootstrap process..."
-
     # 1. Privilege Check & Self-Sudo
     if ! is_root; then
         log "Not running as root. Attempting to escalate via sudo..."
-        exec sudo "$0" "$@"
+        exec sudo -E "$0" "$@"
     fi
+
+    log "Starting Nomad bootstrap process..."
 
     # 2. Bootstrap core dependencies
     # We install these first to ensure we can handle keys and repo management
@@ -80,31 +90,35 @@ main() {
         mkdir -p "$(dirname "$HASHICORP_KEYRING")"
         curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --dearmor -o "$HASHICORP_KEYRING"
         chmod 644 "$HASHICORP_KEYRING"
-    else
-        log "HashiCorp keyring already exists."
     fi
 
     # 4. Setup HashiCorp Repository
-    if [[ ! -f "$HASHICORP_SOURCES" ]]; then
+    if [[ ! -f "$HASHICORP_SOURCES_FILE" ]]; then
         local codename
         codename=$(get_debian_codename)
         log "Adding HashiCorp repository ($codename)..."
-        echo "deb [signed-by=$HASHICORP_KEYRING] https://apt.releases.hashicorp.com $codename main" > "$HASHICORP_SOURCES"
-    else
-        log "HashiCorp repository source already exists."
+        echo "deb [signed-by=$HASHICORP_KEYRING] https://apt.releases.hashicorp.com $codename main" > "/etc/apt/$HASHICORP_SOURCES_FILE"
     fi
 
     # 5. Install Nomad
     # We must update again to pick up the new HashiCorp repo
     log "Updating package lists with HashiCorp repository..."
-    apt-get update -qq
+    apt-get update -qq -o Dir::Etc::sourcelist="$HASHICORP_SOURCES_FILE" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0"
 
-    if [[ "$NOMAD_VERSION" == "latest" ]]; then
-        log "Installing latest Nomad..."
-        apt-get install -y -qq nomad
+    local NOMAD_INSTALL
+    NOMAD_INSTALL=0
+    if [ "$NOMAD_VERSION" = "latest" ]; then
+	if apt list --upgradable nomad 2>&1 | grep 'upgradable from' ; then
+	    NOMAD_INSTALL=1
+	fi
     else
+	if [ "$NOMAD_VERSION" != "$(pkg_version nomad)" ] ; then
+            NOMAD_INSTALL=1
+	fi
+    fi
+    if [ "$NOMAD_INSTALL" = 1 ] ; then
         log "Installing Nomad version: $NOMAD_VERSION..."
-        apt-get install -y -qq "nomad=$NOMAD_VERSION"
+        apt-get install -y -qq "nomad=${NOMAD_VERSION##latest}*"
     fi
 
     # 6. Final Verification
