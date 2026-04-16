@@ -1,0 +1,53 @@
+default_install_hook_types:
+- pre-commit
+default_stages: [pre-commit]
+
+repos:
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v6.0.0
+  hooks:
+  - id: check-added-large-files
+  - id: check-case-conflict
+  - id: check-executables-have-shebangs
+  - id: check-json
+  - id: check-merge-conflict
+  - id: check-symlinks
+  - id: check-toml
+  - id: check-vcs-permalinks
+  - id: check-xml
+  - id: check-yaml
+    args: [--allow-multiple-documents]
+  - id: detect-private-key
+  - id: end-of-file-fixer
+  - id: forbid-new-submodules
+  - id: mixed-line-ending
+    args: [--fix=lf]
+  - id: name-tests-test
+  - id: pretty-format-json
+    args: [--autofix, --no-sort-keys, --indent, '2']
+  - id: trailing-whitespace
+    args: [--markdown-linebreak-ext=md]
+
+- repo: https://github.com/macisamuele/language-formatters-pre-commit-hooks
+  rev: v2.16.0
+  hooks:
+  - id: pretty-format-toml
+    args: [--autofix, --no-sort, --indent, '2']
+  - id: pretty-format-yaml
+    args: [--autofix, --indent, '2']
+
+- repo: https://github.com/jackdewinter/pymarkdown
+  rev: v0.9.36
+  hooks:
+  - id: pymarkdown
+
+- repo: https://github.com/maxwinterstein/shfmt-py
+  rev: v3.12.0.1
+  hooks:
+  - id: shfmt
+    args: [-w, --indent=4, --case-indent, --binary-next-line]
+
+- repo: https://github.com/shellcheck-py/shellcheck-py
+  rev: v0.11.0.1
+  hooks:
+  - id: shellcheck
