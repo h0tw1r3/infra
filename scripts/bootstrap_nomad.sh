@@ -59,9 +59,10 @@ ensure_pkg() {
 main() {
     log "Starting Nomad bootstrap process..."
 
-    # 1. Privilege Check
+    # 1. Privilege Check & Self-Sudo
     if ! is_root; then
-        error "This script must be run as root (or via sudo)."
+        log "Not running as root. Attempting to escalate via sudo..."
+        exec sudo "$0" "$@"
     fi
 
     # 2. Bootstrap core dependencies
