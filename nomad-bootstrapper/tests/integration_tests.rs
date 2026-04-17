@@ -30,6 +30,7 @@ mod tests {
         assert!(stdout.contains("Bootstrap Nomad on Debian hosts over SSH"));
         assert!(stdout.contains("--inventory"));
         assert!(stdout.contains("--phase"));
+        assert!(stdout.contains("--preflight-only"));
         assert!(stdout.contains("--concurrency"));
     }
 
@@ -72,6 +73,34 @@ mod tests {
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("cannot be used together"));
+    }
+
+    #[test]
+    fn test_preflight_only_and_phase_conflict_is_rejected() {
+        let (_dir, inventory) = write_inventory(
+            r#"
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            role = "server"
+            bootstrap_expect = 1
+        "#,
+        );
+
+        let output = Command::new(bin_path())
+            .args([
+                "--inventory",
+                inventory.to_str().expect("inventory path"),
+                "--preflight-only",
+                "--phase",
+                "ensure-deps",
+            ])
+            .output()
+            .expect("run preflight-only conflict");
+        assert!(!output.status.success());
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("--preflight-only cannot be used together"));
     }
 
     #[test]
@@ -153,6 +182,38 @@ mod tests {
         assert!(stdout.contains("Run succeeded"));
         assert!(stdout.contains("queued_for_provisioning"));
         assert!(stdout.contains("running_phase(ensure-deps)"));
+    }
+
+    #[test]
+    fn test_preflight_only_dry_run_reports_preflight_summary() {
+        let (_dir, inventory) = write_inventory(
+            r#"
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            role = "server"
+            bootstrap_expect = 1
+        "#,
+        );
+
+        let output = Command::new(bin_path())
+            .args([
+                "--inventory",
+                inventory.to_str().expect("inventory path"),
+                "--dry-run",
+                "--preflight-only",
+                "--log-level",
+                "warn",
+            ])
+            .output()
+            .expect("run preflight-only dry-run");
+        assert!(output.status.success(), "{:?}", output);
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Run succeeded"));
+        assert!(stdout.contains("preflight_passed"));
+        assert!(!stdout.contains("queued_for_provisioning"));
+        assert!(!stdout.contains("running_phase("));
     }
 
     #[test]

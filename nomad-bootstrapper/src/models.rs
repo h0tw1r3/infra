@@ -93,6 +93,7 @@ pub struct ResolvedTarget {
     pub identity_file: Option<String>,
     pub port: Option<u16>,
     pub options: Vec<String>,
+    pub privilege_escalation: Option<Vec<String>>,
 }
 
 impl ResolvedTarget {

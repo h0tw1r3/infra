@@ -22,7 +22,10 @@ enum HostStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RunAbortReason {
     PreflightFailure,
-    GateInvalidation { host: String, message: String },
+    GateInvalidation {
+        host: String,
+        message: String,
+    },
     ProvisioningFailure {
         host: String,
         phase: String,
@@ -46,6 +49,12 @@ pub fn run(args: &Args) -> Result<()> {
     );
 
     let statuses = preflight::run(&nodes, &phases, &transport, execution)?;
+    if args.preflight_only {
+        println!("{}", render_run_summary(&nodes, &[], &statuses, None));
+        info!("Nomad preflight-only run complete");
+        return Ok(());
+    }
+
     provisioning::run(&nodes, &phases, &transport, execution, statuses)?;
 
     info!("Nomad controller run complete");
@@ -86,7 +95,10 @@ fn render_abort_reason(reason: &RunAbortReason) -> String {
             host,
             phase,
             message,
-        } => format!("provisioning failure on {} during {}: {}", host, phase, message),
+        } => format!(
+            "provisioning failure on {} during {}: {}",
+            host, phase, message
+        ),
     }
 }
 
@@ -169,7 +181,10 @@ fn render_state_path(
 }
 
 fn all_phase_names(phases: &[&dyn PhaseExecutor]) -> Vec<String> {
-    phases.iter().map(|phase| phase.name().to_string()).collect()
+    phases
+        .iter()
+        .map(|phase| phase.name().to_string())
+        .collect()
 }
 
 fn phase_names_through(phases: &[&dyn PhaseExecutor], stop_after: &str) -> Vec<String> {
@@ -215,6 +230,7 @@ mod tests {
                     identity_file: None,
                     port: None,
                     options: Vec::new(),
+                    privilege_escalation: None,
                 },
                 config: NodeConfig {
                     name: "node-1".to_string(),
@@ -237,6 +253,7 @@ mod tests {
                     identity_file: None,
                     port: None,
                     options: Vec::new(),
+                    privilege_escalation: None,
                 },
                 config: NodeConfig {
                     name: "node-2".to_string(),
@@ -294,9 +311,8 @@ mod tests {
         );
 
         assert!(summary.contains("Run aborted: provisioning failure on node-2 during install"));
-        assert!(summary.contains(
-            "node-1: preflight_passed [states: pending_preflight -> preflight_passed]"
-        ));
+        assert!(summary
+            .contains("node-1: preflight_passed [states: pending_preflight -> preflight_passed]"));
         assert!(summary.contains(
             "node-2: provisioning_failed [install] (boom) [states: pending_preflight -> preflight_passed -> queued_for_provisioning -> running_phase(install) -> provisioning_failed]"
         ));
@@ -325,10 +341,11 @@ mod tests {
             command: &str,
             _input: Option<&[u8]>,
         ) -> Result<RemoteOutput> {
-            self.calls
-                .lock()
-                .expect("calls lock")
-                .push(format!("exec:{}:{}", target.label(), command));
+            self.calls.lock().expect("calls lock").push(format!(
+                "exec:{}:{}",
+                target.label(),
+                command
+            ));
 
             let stdout = if command == "cat /etc/os-release" {
                 "ID=debian\nVERSION_CODENAME=bookworm\n".to_string()

@@ -9,6 +9,7 @@ Instead of installing the tool on every node, you run it once from your control 
 - **Remote-first**: runs from your laptop, CI runner, or admin box over SSH
 - **Declarative inventory**: cluster topology, Nomad role, and SSH settings live in TOML
 - **Strict fleet preflight**: connectivity, Debian compatibility, and provisioning capability are validated before any mutating phase starts
+- **Configurable privilege path**: non-root SSH users can run privileged operations through a configured escalation command such as `sudo -n` or `doas`
 - **Hybrid idempotency**: live remote probes are authoritative; an optional node-local state file is advisory only
 - **Retained SSH sessions**: preflight-established sessions are reused for provisioning, while still honoring global and per-node SSH overrides
 - **Debian-focused**: supports Debian hosts in v1, with a transport/backend split that keeps future host support straightforward
@@ -20,7 +21,7 @@ Instead of installing the tool on every node, you run it once from your control 
 - `ssh` available on the control machine
 - SSH access to each target host
 - Debian on every managed node
-- Remote privilege escalation already handled by the SSH account you use (for example, logging in as `root`)
+- Either SSH access as `root`, or a non-root SSH user with a non-interactive privilege escalation command (for example, `sudo -n`)
 
 ## Build and Test
 
@@ -52,9 +53,10 @@ high_latency = true
 concurrency = 3
 
 [ssh]
-user = "root"
+user = "admin"
 identity_file = "~/.ssh/id_ed25519"
 options = ["StrictHostKeyChecking=accept-new"]
+privilege_escalation = ["sudo", "-n"]
 
 [[nodes]]
 name = "server-1"
@@ -70,7 +72,8 @@ role = "client"
 server_address = ["10.0.1.1:4647", "10.0.1.2:4647"]
 
 [nodes.ssh]
-user = "admin"
+user = "root"
+privilege_escalation = []
 ```
 
 ### Inventory Rules
@@ -83,6 +86,7 @@ user = "admin"
   1. your existing SSH agent/config when no override is provided
   2. global `[ssh]` defaults
   3. per-node `[nodes.ssh]` overrides
+- `privilege_escalation` is an optional argv-style command list used only for non-root SSH users. Per-node overrides replace the global value, `[]` disables an inherited value, and remote root sessions bypass escalation.
 
 ## Usage
 
@@ -94,6 +98,11 @@ user = "admin"
 ./target/release/nomad-bootstrapper \
   --inventory ./inventory.toml \
   --phase configure
+
+# Run only the fleet-wide preflight gate
+./target/release/nomad-bootstrapper \
+  --inventory ./inventory.toml \
+  --preflight-only
 
 # Run through verify in dry-run mode
 ./target/release/nomad-bootstrapper \
@@ -121,6 +130,9 @@ OPTIONS:
 
     --up-to <PHASE>
         Run every phase up to and including the named phase
+
+    --preflight-only
+        Run only the fleet-wide preflight gate and skip provisioning
 
     --dry-run
         Show what would be executed without changing remote hosts

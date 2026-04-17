@@ -69,7 +69,7 @@ impl ProvisionedState {
             }
         };
 
-        if let Err(err) = host.write_file_atomic(PROVISIONED_STATE_PATH, &raw, 0o640) {
+        if let Err(err) = host.write_file_atomic_privileged(PROVISIONED_STATE_PATH, &raw, 0o640) {
             warn!(
                 "host {}: failed to write optional state file {}: {}",
                 host.label(),
@@ -140,6 +140,7 @@ mod tests {
             identity_file: None,
             port: None,
             options: Vec::new(),
+            privilege_escalation: None,
         }));
         RemoteHost::new(transport, target)
     }

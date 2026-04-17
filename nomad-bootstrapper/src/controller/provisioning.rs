@@ -51,17 +51,11 @@ pub(super) fn run(
     });
 
     let abort_reason = current_abort(&abort_reason);
-    let mut statuses = statuses
-        .lock()
-        .expect("provisioning results lock")
-        .clone();
+    let mut statuses = statuses.lock().expect("provisioning results lock").clone();
 
     if matches!(
         abort_reason,
-        Some(
-            RunAbortReason::ProvisioningFailure { .. }
-                | RunAbortReason::GateInvalidation { .. }
-        )
+        Some(RunAbortReason::ProvisioningFailure { .. } | RunAbortReason::GateInvalidation { .. })
     ) {
         for status in &mut statuses {
             if matches!(status, HostStatus::PreflightPassed) {
@@ -121,7 +115,11 @@ fn run_host(
             };
         }
 
-        info!("Host {}: starting phase {}", host.remote().label(), phase.name());
+        info!(
+            "Host {}: starting phase {}",
+            host.remote().label(),
+            phase.name()
+        );
         match phase.execute(&host, &node.config, &mut ctx) {
             Ok(result) => {
                 info!(
@@ -169,9 +167,9 @@ fn set_abort_once(abort_reason: &Arc<Mutex<Option<RunAbortReason>>>, reason: Run
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
     use super::*;
     use std::sync::{Arc, Barrier};
+    use std::time::Duration;
 
     use crate::models::{
         LatencyProfile, NodeConfig, NodeRole, PhaseResult, ResolvedTarget, ServerConfig,
@@ -292,6 +290,7 @@ mod tests {
                     identity_file: None,
                     port: None,
                     options: Vec::new(),
+                    privilege_escalation: None,
                 },
                 config: NodeConfig {
                     name: (*name).to_string(),
@@ -342,7 +341,7 @@ mod tests {
             &FakeTransport {
                 invalidated_host: Some("node-1"),
             },
-            ExecutionConfig { concurrency: 2 },
+            ExecutionConfig { concurrency: 1 },
             vec![HostStatus::PreflightPassed; 2],
         )
         .expect_err("expected gate invalidation");
@@ -381,13 +380,11 @@ mod tests {
         assert!(message.contains("Run aborted: provisioning failure on node-1 during phase-one"));
         assert!(message.contains("node-1: provisioning_failed [phase-one] (phase one failed)"));
         assert!(message.contains("node-2: skipped_after_peer_failure (after phase-one)"));
-        assert!(
-            !calls
-                .lock()
-                .expect("calls lock")
-                .iter()
-                .any(|entry| entry == "node-2:phase-two")
-        );
+        assert!(!calls
+            .lock()
+            .expect("calls lock")
+            .iter()
+            .any(|entry| entry == "node-2:phase-two"));
     }
 
     struct TrackingPhase {
@@ -402,10 +399,11 @@ mod tests {
             _config: &NodeConfig,
             _ctx: &mut ExecutionContext,
         ) -> Result<PhaseResult> {
-            self.calls
-                .lock()
-                .expect("calls lock")
-                .push(format!("{}:{}", host.remote().label(), self.name));
+            self.calls.lock().expect("calls lock").push(format!(
+                "{}:{}",
+                host.remote().label(),
+                self.name
+            ));
             Ok(PhaseResult::unchanged(self.name, "ok"))
         }
 

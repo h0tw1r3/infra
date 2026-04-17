@@ -97,8 +97,8 @@ fn validate_privileges(host: &DebianHost<'_>, phases: &[&dyn PhaseExecutor]) -> 
         return Ok(());
     }
 
-    host.remote().run_checked(
-        "set -eu; test \"$(id -u)\" -eq 0 && command -v apt-get >/dev/null && command -v systemctl >/dev/null && command -v mktemp >/dev/null && command -v mkdir >/dev/null && command -v chmod >/dev/null && command -v mv >/dev/null",
+    host.remote().run_privileged_checked(
+        "set -eu; test -w /etc && command -v apt-get >/dev/null && command -v curl >/dev/null && command -v gpg >/dev/null && command -v systemctl >/dev/null && command -v mktemp >/dev/null && command -v mkdir >/dev/null && command -v chmod >/dev/null && command -v mv >/dev/null && command -v rm >/dev/null",
     )?;
     Ok(())
 }
@@ -148,6 +148,14 @@ mod tests {
                 });
             }
 
+            if command == "id -u" {
+                return Ok(RemoteOutput {
+                    status: 0,
+                    stdout: "1000\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+
             Ok(RemoteOutput {
                 status: 0,
                 stdout: String::new(),
@@ -184,6 +192,7 @@ mod tests {
                     identity_file: None,
                     port: None,
                     options: Vec::new(),
+                    privilege_escalation: Some(vec!["sudo".to_string(), "-n".to_string()]),
                 },
                 config: NodeConfig {
                     name: (*name).to_string(),
@@ -220,5 +229,119 @@ mod tests {
         assert!(message.contains("Run aborted: preflight failure"));
         assert!(message.contains("node-1: preflight_passed"));
         assert!(message.contains("node-2: preflight_failed (ssh authentication failed)"));
+    }
+
+    #[test]
+    fn test_preflight_fails_for_non_root_without_escalation() {
+        let mut nodes = nodes();
+        nodes[0].target.privilege_escalation = None;
+        nodes[1].target.privilege_escalation = None;
+        let phase = FakePhase("install");
+        let phases: Vec<&dyn PhaseExecutor> = vec![&phase];
+        let err = run(
+            &nodes,
+            &phases,
+            &FakeTransport {
+                failing_host: "none",
+            },
+            ExecutionConfig { concurrency: 1 },
+        )
+        .expect_err("expected preflight failure");
+
+        assert!(err
+            .to_string()
+            .contains("requires configured privilege escalation"));
+    }
+
+    struct EscalationFailureTransport {
+        status: i32,
+        stderr: &'static str,
+    }
+
+    impl Transport for EscalationFailureTransport {
+        fn is_dry_run(&self) -> bool {
+            false
+        }
+
+        fn exec(
+            &self,
+            _target: &ResolvedTarget,
+            command: &str,
+            _input: Option<&[u8]>,
+        ) -> Result<RemoteOutput> {
+            if command == "true" {
+                return Ok(RemoteOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+
+            if command == "cat /etc/os-release" {
+                return Ok(RemoteOutput {
+                    status: 0,
+                    stdout: "ID=debian\nVERSION_CODENAME=bookworm\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+
+            if command == "id -u" {
+                return Ok(RemoteOutput {
+                    status: 0,
+                    stdout: "1000\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+
+            if command.starts_with("sudo -n sh -lc") {
+                return Ok(RemoteOutput {
+                    status: self.status,
+                    stdout: String::new(),
+                    stderr: self.stderr.to_string(),
+                });
+            }
+
+            Ok(RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn test_preflight_reports_missing_escalation_binary() {
+        let phase = FakePhase("install");
+        let phases: Vec<&dyn PhaseExecutor> = vec![&phase];
+        let err = run(
+            &nodes(),
+            &phases,
+            &EscalationFailureTransport {
+                status: 127,
+                stderr: "sudo: command not found",
+            },
+            ExecutionConfig { concurrency: 1 },
+        )
+        .expect_err("expected preflight failure");
+
+        assert!(err.to_string().contains("sudo: command not found"));
+    }
+
+    #[test]
+    fn test_preflight_reports_escalation_permission_failure() {
+        let phase = FakePhase("install");
+        let phases: Vec<&dyn PhaseExecutor> = vec![&phase];
+        let err = run(
+            &nodes(),
+            &phases,
+            &EscalationFailureTransport {
+                status: 1,
+                stderr: "sudo: a password is required",
+            },
+            ExecutionConfig { concurrency: 1 },
+        )
+        .expect_err("expected preflight failure");
+
+        assert!(err.to_string().contains("sudo: a password is required"));
     }
 }

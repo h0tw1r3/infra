@@ -64,7 +64,7 @@ impl<'a> DebianHost<'a> {
         if self.remote.is_dry_run() {
             return Ok(None);
         }
-        self.remote.read_file(NOMAD_CONFIG_PATH)
+        self.remote.read_file_privileged(NOMAD_CONFIG_PATH)
     }
 
     pub fn read_repo_file(&self) -> Result<Option<String>> {
@@ -118,7 +118,7 @@ impl<'a> DebianHost<'a> {
 
     pub fn write_repo_file(&self, content: &str) -> Result<()> {
         self.remote
-            .write_file_atomic(HASHICORP_SOURCE_LIST_PATH, content, 0o644)
+            .write_file_atomic_privileged(HASHICORP_SOURCE_LIST_PATH, content, 0o644)
     }
 
     pub fn fetch_hashicorp_keyring(&self) -> Result<()> {
@@ -126,12 +126,12 @@ impl<'a> DebianHost<'a> {
             "set -eu; mkdir -p /usr/share/keyrings; tmp=$(mktemp /tmp/hashicorp-key.XXXXXX); curl -fsSL https://apt.releases.hashicorp.com/gpg -o \"$tmp\"; gpg --dearmor -o {keyring} \"$tmp\"; rm -f \"$tmp\"",
             keyring = shell_quote(HASHICORP_KEYRING_PATH)
         );
-        self.remote.run_checked(&command)?;
+        self.remote.run_privileged_checked(&command)?;
         Ok(())
     }
 
     pub fn apt_update(&self) -> Result<()> {
-        self.remote.run_checked("apt-get update -qq")?;
+        self.remote.run_privileged_checked("apt-get update -qq")?;
         Ok(())
     }
 
@@ -142,7 +142,7 @@ impl<'a> DebianHost<'a> {
             .collect::<Vec<_>>()
             .join(" ");
         self.remote
-            .run_checked(&format!("apt-get install -y -qq {}", joined))?;
+            .run_privileged_checked(&format!("apt-get install -y -qq {}", joined))?;
         Ok(())
     }
 
@@ -152,12 +152,13 @@ impl<'a> DebianHost<'a> {
             path = shell_quote(NOMAD_CONFIG_PATH)
         );
         self.remote
-            .run_with_input_checked(&command, config.as_bytes())?;
+            .run_privileged_with_input_checked(&command, config.as_bytes())?;
         Ok(())
     }
 
     pub fn restart_nomad(&self) -> Result<()> {
-        self.remote.run_checked("systemctl restart nomad")?;
+        self.remote
+            .run_privileged_checked("systemctl restart nomad")?;
         Ok(())
     }
 

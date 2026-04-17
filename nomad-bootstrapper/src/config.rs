@@ -31,6 +31,10 @@ pub struct Args {
     #[arg(long, value_parser = PHASE_NAMES)]
     pub up_to: Option<String>,
 
+    /// Run only the fleet-wide preflight gate and skip provisioning.
+    #[arg(long, default_value_t = false)]
+    pub preflight_only: bool,
+
     /// Show what would be done without making remote changes.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
@@ -46,11 +50,18 @@ pub struct Args {
 
 impl Args {
     pub fn parse_and_init_logging() -> Result<Self> {
-        let args = Self::parse();
+        let args = Self::parse().validated()?;
         env_logger::Builder::from_default_env()
             .filter_level(args.log_level.parse::<LevelFilter>()?)
             .init();
         Ok(args)
+    }
+
+    fn validated(self) -> Result<Self> {
+        if self.preflight_only && (self.phase.is_some() || self.up_to.is_some()) {
+            anyhow::bail!("--preflight-only cannot be used together with --phase or --up-to");
+        }
+        Ok(self)
     }
 }
 
@@ -94,6 +105,7 @@ pub struct SshConfig {
     pub identity_file: Option<String>,
     pub port: Option<u16>,
     pub options: Vec<String>,
+    pub privilege_escalation: Option<Vec<String>>,
 }
 
 impl SshConfig {
@@ -112,6 +124,11 @@ impl SshConfig {
                 .or_else(|| self.identity_file.clone()),
             port: override_config.and_then(|cfg| cfg.port).or(self.port),
             options,
+            privilege_escalation: normalize_escalation(
+                override_config
+                    .and_then(|cfg| cfg.privilege_escalation.clone())
+                    .or_else(|| self.privilege_escalation.clone()),
+            ),
         }
     }
 }
@@ -122,6 +139,7 @@ struct ResolvedTargetSsh {
     identity_file: Option<String>,
     port: Option<u16>,
     options: Vec<String>,
+    privilege_escalation: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -291,10 +309,44 @@ impl Inventory {
                 identity_file: merged_ssh.identity_file,
                 port: merged_ssh.port,
                 options: merged_ssh.options,
+                privilege_escalation: validate_privilege_escalation(
+                    name,
+                    merged_ssh.privilege_escalation,
+                )?,
             },
             config,
         })
     }
+}
+
+fn normalize_escalation(value: Option<Vec<String>>) -> Option<Vec<String>> {
+    match value {
+        Some(values) if values.is_empty() => None,
+        other => other,
+    }
+}
+
+fn validate_privilege_escalation(
+    node_name: &str,
+    escalation: Option<Vec<String>>,
+) -> Result<Option<Vec<String>>> {
+    escalation
+        .map(|values| {
+            values
+                .into_iter()
+                .map(|value| {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        anyhow::bail!(
+                            "node '{}' privilege escalation entries cannot be empty",
+                            node_name
+                        );
+                    }
+                    Ok(trimmed.to_string())
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()
 }
 
 fn validate_address(val: &str) -> std::result::Result<String, String> {
@@ -391,6 +443,7 @@ mod tests {
             inventory: PathBuf::from("inventory.toml"),
             phase: None,
             up_to: None,
+            preflight_only: false,
             dry_run: false,
             log_level: "info".to_string(),
             concurrency: concurrency.and_then(NonZeroUsize::new),
@@ -412,6 +465,7 @@ mod tests {
         user = "admin"
         identity_file = "~/.ssh/id_ed25519"
         options = ["StrictHostKeyChecking=accept-new"]
+        privilege_escalation = ["sudo", "-n"]
 
         [[nodes]]
         name = "server-1"
@@ -423,6 +477,7 @@ mod tests {
         [nodes.ssh]
         user = "root"
         port = 2222
+        privilege_escalation = ["doas"]
 
         [[nodes]]
         name = "client-1"
@@ -448,6 +503,16 @@ mod tests {
         assert_eq!(
             server.target.options,
             vec!["StrictHostKeyChecking=accept-new".to_string()]
+        );
+        assert_eq!(
+            server.target.privilege_escalation,
+            Some(vec!["doas".to_string()])
+        );
+
+        let client = &nodes[1];
+        assert_eq!(
+            client.target.privilege_escalation,
+            Some(vec!["sudo".to_string(), "-n".to_string()])
         );
     }
 
@@ -507,6 +572,48 @@ mod tests {
             .resolve_execution(&args_with_concurrency(None), 1)
             .expect_err("expected validation error");
         assert!(err.to_string().contains("greater than 0"));
+    }
+
+    #[test]
+    fn test_empty_node_privilege_escalation_disables_inherited_default() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [ssh]
+            privilege_escalation = ["sudo", "-n"]
+
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            role = "server"
+            bootstrap_expect = 1
+
+            [nodes.ssh]
+            privilege_escalation = []
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        assert_eq!(nodes[0].target.privilege_escalation, None);
+    }
+
+    #[test]
+    fn test_args_reject_preflight_only_with_phase_selection() {
+        let err = Args {
+            inventory: PathBuf::from("inventory.toml"),
+            phase: Some("ensure-deps".to_string()),
+            up_to: None,
+            preflight_only: true,
+            dry_run: false,
+            log_level: "info".to_string(),
+            concurrency: None,
+        }
+        .validated()
+        .expect_err("expected invalid flag combination");
+
+        assert!(err
+            .to_string()
+            .contains("--preflight-only cannot be used together"));
     }
 
     #[test]

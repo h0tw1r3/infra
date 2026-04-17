@@ -67,12 +67,7 @@ impl SshTransport {
 
     fn get_or_connect_session(&self, target: &ResolvedTarget) -> Result<Arc<Session>> {
         let key = session_key(target);
-        if let Some(handle) = self
-            .sessions
-            .lock()
-            .expect("SSH sessions lock")
-            .get(&key)
-        {
+        if let Some(handle) = self.sessions.lock().expect("SSH sessions lock").get(&key) {
             return Ok(Arc::clone(&handle.session));
         }
 
@@ -103,7 +98,13 @@ impl SshTransport {
             .stdout(ProcessStdio::piped())
             .stderr(ProcessStdio::piped())
             .output()
-            .map_err(|err| anyhow::anyhow!("failed to start ssh session for {}: {}", target.label(), err))?;
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to start ssh session for {}: {}",
+                    target.label(),
+                    err
+                )
+            })?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -123,7 +124,10 @@ impl SshTransport {
         }
 
         Ok(SessionHandle {
-            session: Arc::new(Session::resume(control_path.clone().into_boxed_path(), None)),
+            session: Arc::new(Session::resume(
+                control_path.clone().into_boxed_path(),
+                None,
+            )),
             control_dir,
             control_path,
             host: target.host.clone(),
@@ -133,7 +137,10 @@ impl SshTransport {
     fn close_all_sessions(&self) {
         let handles = {
             let mut sessions = self.sessions.lock().expect("SSH sessions lock");
-            sessions.drain().map(|(_, handle)| handle).collect::<Vec<_>>()
+            sessions
+                .drain()
+                .map(|(_, handle)| handle)
+                .collect::<Vec<_>>()
         };
 
         if handles.is_empty() {
@@ -185,14 +192,19 @@ impl Transport for SshTransport {
             .expect("SSH sessions lock")
             .get(&key)
             .map(|handle| Arc::clone(&handle.session))
-            .ok_or_else(|| anyhow::anyhow!("no retained SSH session exists for {}", target.label()))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("no retained SSH session exists for {}", target.label())
+            })?;
 
         let runtime = self.runtime.lock().expect("SSH runtime lock");
         runtime.block_on(async move {
-            session
-                .check()
-                .await
-                .map_err(|err| anyhow::anyhow!("retained SSH session is unhealthy for {}: {}", target.label(), err))
+            session.check().await.map_err(|err| {
+                anyhow::anyhow!(
+                    "retained SSH session is unhealthy for {}: {}",
+                    target.label(),
+                    err
+                )
+            })
         })
     }
 
@@ -237,15 +249,18 @@ impl Transport for SshTransport {
                     .stderr(Stdio::piped());
 
                 let mut child = remote_command.spawn().await.map_err(|err| {
-                    anyhow::anyhow!("failed to start remote command for {}: {}", target.label(), err)
+                    anyhow::anyhow!(
+                        "failed to start remote command for {}: {}",
+                        target.label(),
+                        err
+                    )
                 })?;
                 let mut stdin = child.stdin().take().ok_or_else(|| {
                     anyhow::anyhow!("failed to open remote stdin for {}", target.label())
                 })?;
-                stdin
-                    .write_all(input)
-                    .await
-                    .with_context(|| format!("failed to write remote stdin for {}", target.label()))?;
+                stdin.write_all(input).await.with_context(|| {
+                    format!("failed to write remote stdin for {}", target.label())
+                })?;
                 drop(stdin);
                 child.wait_with_output().await.map_err(|err| {
                     anyhow::anyhow!(
@@ -256,7 +271,11 @@ impl Transport for SshTransport {
                 })?
             } else {
                 remote_command.output().await.map_err(|err| {
-                    anyhow::anyhow!("failed to run remote command for {}: {}", target.label(), err)
+                    anyhow::anyhow!(
+                        "failed to run remote command for {}: {}",
+                        target.label(),
+                        err
+                    )
                 })?
             };
 
@@ -305,9 +324,30 @@ impl<'a> RemoteHost<'a> {
         Ok(output)
     }
 
-    pub fn run_with_input_checked(&self, command: &str, input: &[u8]) -> Result<RemoteOutput> {
-        let output = self.transport.exec(self.target, command, Some(input))?;
-        ensure_success(self.label(), command, &output)?;
+    pub fn current_uid(&self) -> Result<u32> {
+        let output = self.run_checked("id -u")?;
+        output
+            .stdout
+            .trim()
+            .parse::<u32>()
+            .map_err(|err| anyhow::anyhow!("host {} returned invalid uid: {}", self.label(), err))
+    }
+
+    pub fn run_privileged_checked(&self, command: &str) -> Result<RemoteOutput> {
+        let command = self.privileged_command(command)?;
+        let output = self.run(&command)?;
+        ensure_success(self.label(), &command, &output)?;
+        Ok(output)
+    }
+
+    pub fn run_privileged_with_input_checked(
+        &self,
+        command: &str,
+        input: &[u8],
+    ) -> Result<RemoteOutput> {
+        let command = self.privileged_command(command)?;
+        let output = self.transport.exec(self.target, &command, Some(input))?;
+        ensure_success(self.label(), &command, &output)?;
         Ok(output)
     }
 
@@ -330,7 +370,21 @@ impl<'a> RemoteHost<'a> {
         }
     }
 
-    pub fn write_file_atomic(&self, path: &str, content: &str, mode: u32) -> Result<()> {
+    pub fn read_file_privileged(&self, path: &str) -> Result<Option<String>> {
+        let command = format!(
+            "if [ -f {} ]; then cat {}; fi",
+            shell_quote(path),
+            shell_quote(path)
+        );
+        let output = self.run_privileged_checked(&command)?;
+        if output.stdout.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(output.stdout))
+        }
+    }
+
+    pub fn write_file_atomic_privileged(&self, path: &str, content: &str, mode: u32) -> Result<()> {
         let parent = Path::new(path)
             .parent()
             .and_then(|value| value.to_str())
@@ -341,8 +395,32 @@ impl<'a> RemoteHost<'a> {
             mode = mode,
             path = shell_quote(path),
         );
-        self.run_with_input_checked(&command, content.as_bytes())?;
+        self.run_privileged_with_input_checked(&command, content.as_bytes())?;
         Ok(())
+    }
+
+    fn privileged_command(&self, command: &str) -> Result<String> {
+        if self.is_dry_run() {
+            return Ok(command.to_string());
+        }
+
+        if self.current_uid()? == 0 {
+            return Ok(command.to_string());
+        }
+
+        let escalation = self.target.privilege_escalation.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "host {} requires configured privilege escalation for privileged command",
+                self.label()
+            )
+        })?;
+
+        let prefix = escalation
+            .iter()
+            .map(|value| shell_quote(value))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(format!("{} sh -lc {}", prefix, shell_quote(command)))
     }
 }
 
@@ -435,7 +513,10 @@ fn session_key(target: &ResolvedTarget) -> String {
         "{}\u{1f}|{}\u{1f}|{}\u{1f}|{}\u{1f}|{}",
         target.host,
         target.user.as_deref().unwrap_or_default(),
-        target.port.map(|value| value.to_string()).unwrap_or_default(),
+        target
+            .port
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
         target.identity_file.as_deref().unwrap_or_default(),
         target.options.join("\u{1e}")
     )
@@ -457,6 +538,7 @@ mod tests {
             identity_file: Some("~/.ssh/id_ed25519".to_string()),
             port: Some(2222),
             options: vec!["StrictHostKeyChecking=accept-new".to_string()],
+            privilege_escalation: None,
         }
     }
 
@@ -504,5 +586,118 @@ mod tests {
         let mut changed_option = target();
         changed_option.options.push("Compression=yes".to_string());
         assert_ne!(baseline, session_key(&changed_option));
+    }
+
+    struct RecordingTransport {
+        outputs: std::sync::Mutex<Vec<RemoteOutput>>,
+        commands: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingTransport {
+        fn new(outputs: Vec<RemoteOutput>) -> Self {
+            Self {
+                outputs: std::sync::Mutex::new(outputs.into_iter().rev().collect()),
+                commands: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Transport for RecordingTransport {
+        fn is_dry_run(&self) -> bool {
+            false
+        }
+
+        fn exec(
+            &self,
+            _target: &ResolvedTarget,
+            command: &str,
+            _input: Option<&[u8]>,
+        ) -> Result<RemoteOutput> {
+            self.commands
+                .lock()
+                .expect("commands lock")
+                .push(command.to_string());
+            Ok(self
+                .outputs
+                .lock()
+                .expect("outputs lock")
+                .pop()
+                .expect("output"))
+        }
+    }
+
+    #[test]
+    fn test_run_privileged_checked_bypasses_escalation_for_root() {
+        let transport = RecordingTransport::new(vec![
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        ]);
+        let mut target = target();
+        target.privilege_escalation = Some(vec!["sudo".to_string(), "-n".to_string()]);
+        let remote = RemoteHost::new(&transport, &target);
+
+        remote
+            .run_privileged_checked("apt-get update -qq")
+            .expect("privileged command succeeds");
+
+        let commands = transport.commands.lock().expect("commands lock");
+        assert_eq!(commands[0], "id -u");
+        assert_eq!(commands[1], "apt-get update -qq");
+    }
+
+    #[test]
+    fn test_run_privileged_checked_uses_configured_escalation_for_non_root() {
+        let transport = RecordingTransport::new(vec![
+            RemoteOutput {
+                status: 0,
+                stdout: "1000\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        ]);
+        let mut target = target();
+        target.user = Some("admin".to_string());
+        target.privilege_escalation = Some(vec!["sudo".to_string(), "-n".to_string()]);
+        let remote = RemoteHost::new(&transport, &target);
+
+        remote
+            .run_privileged_checked("apt-get update -qq")
+            .expect("privileged command succeeds");
+
+        let commands = transport.commands.lock().expect("commands lock");
+        assert_eq!(commands[0], "id -u");
+        assert_eq!(commands[1], "sudo -n sh -lc 'apt-get update -qq'");
+    }
+
+    #[test]
+    fn test_run_privileged_checked_rejects_non_root_without_escalation() {
+        let transport = RecordingTransport::new(vec![RemoteOutput {
+            status: 0,
+            stdout: "1000\n".to_string(),
+            stderr: String::new(),
+        }]);
+        let mut target = target();
+        target.user = Some("admin".to_string());
+        target.privilege_escalation = None;
+        let remote = RemoteHost::new(&transport, &target);
+
+        let err = remote
+            .run_privileged_checked("apt-get update -qq")
+            .expect_err("missing escalation should fail");
+        assert!(err
+            .to_string()
+            .contains("requires configured privilege escalation"));
     }
 }
