@@ -56,7 +56,13 @@ pub(super) fn run(
         .expect("provisioning results lock")
         .clone();
 
-    if matches!(abort_reason, Some(RunAbortReason::ProvisioningFailure { .. })) {
+    if matches!(
+        abort_reason,
+        Some(
+            RunAbortReason::ProvisioningFailure { .. }
+                | RunAbortReason::GateInvalidation { .. }
+        )
+    ) {
         for status in &mut statuses {
             if matches!(status, HostStatus::PreflightPassed) {
                 *status = HostStatus::SkippedAfterAbort { after_phase: None };
@@ -320,6 +326,28 @@ mod tests {
         assert!(message.contains("Run aborted: gate invalidation on node-2"));
         assert!(message.contains("node-1: provisioning_succeeded"));
         assert!(message.contains("node-2: gate_invalidated"));
+    }
+
+    #[test]
+    fn test_gate_invalidation_marks_unstarted_hosts_as_skipped() {
+        let nodes = nodes();
+        let phase = SuccessPhase("install");
+        let phases: Vec<&dyn PhaseExecutor> = vec![&phase];
+        let err = run(
+            &nodes,
+            &phases,
+            &FakeTransport {
+                invalidated_host: Some("node-1"),
+            },
+            ExecutionConfig { concurrency: 2 },
+            vec![HostStatus::PreflightPassed; 2],
+        )
+        .expect_err("expected gate invalidation");
+
+        let message = err.to_string();
+        assert!(message.contains("Run aborted: gate invalidation on node-1"));
+        assert!(message.contains("node-1: gate_invalidated"));
+        assert!(message.contains("node-2: skipped_after_abort"));
     }
 
     #[test]
