@@ -42,22 +42,23 @@ The tool automatically escalates to root when needed using `sudo`, `doas`, or `p
 ```bash
 # Bootstrap a new server (first node in cluster)
 ./target/release/nomad-bootstrapper \
-  --version 1.6.0 \
+  --nomad-version 1.6.0 \
   --role server \
   --bootstrap-expect 1
 
 # Bootstrap a client
 ./target/release/nomad-bootstrapper \
-  --version 1.6.0 \
+  --nomad-version 1.6.0 \
   --role client \
-  --server-address "10.0.1.1:4647"
+  --server-address 10.0.1.1:4647
 
 # Bootstrap server with high-latency tuning
 ./target/release/nomad-bootstrapper \
-  --version 1.6.0 \
+  --nomad-version 1.6.0 \
   --role server \
   --bootstrap-expect 3 \
-  --server-join-address "10.0.1.2:4647,10.0.1.3:4647" \
+  --server-join-address 10.0.1.2:4647 \
+  --server-join-address 10.0.1.3:4647 \
   --high-latency
 ```
 
@@ -113,17 +114,19 @@ USAGE:
     nomad-bootstrapper [OPTIONS]
 
 OPTIONS:
-    --version <VERSION>
+    --nomad-version <VERSION>
         Nomad version to install (default: latest)
+        Use "latest" to install/upgrade to the newest available package
 
     --role <ROLE>
-        Node role: server or client (required)
+        Node role: server or client
+        Required when running the configure phase
 
     --bootstrap-expect <N>
         For server: number of servers in initial cluster (required for --role server)
 
     --server-join-address <ADDRESS>
-        For server: another server to join (can be specified multiple times, e.g., --server-join-address 10.0.1.2:4647)
+        For server: another server to join (can be specified multiple times)
 
     --server-address <ADDRESS>
         For client: a Nomad server address (can be specified multiple times, required for --role client)
@@ -152,8 +155,8 @@ OPTIONS:
 
 **Node 1 (bootstrap node):**
 ```bash
-sudo nomad-bootstrapper \
-  --version 1.6.0 \
+nomad-bootstrapper \
+  --nomad-version 1.6.0 \
   --role server \
   --bootstrap-expect 3 \
   --high-latency
@@ -161,11 +164,11 @@ sudo nomad-bootstrapper \
 
 **Node 2 & 3 (join existing cluster):**
 ```bash
-sudo nomad-bootstrapper \
-  --version 1.6.0 \
+nomad-bootstrapper \
+  --nomad-version 1.6.0 \
   --role server \
   --bootstrap-expect 3 \
-  --server-join-address "10.0.1.1:4647" \
+  --server-join-address 10.0.1.1:4647 \
   --high-latency
 ```
 
@@ -175,21 +178,22 @@ Change from standalone server to cluster member:
 
 ```bash
 # Original: Single server
-sudo nomad-bootstrapper --version 1.6.0 --role server --bootstrap-expect 1
+nomad-bootstrapper --nomad-version 1.6.0 --role server --bootstrap-expect 1
 
 # Later: Join 3-node cluster
-sudo nomad-bootstrapper \
-  --version 1.6.0 \
+nomad-bootstrapper \
+  --nomad-version 1.6.0 \
   --role server \
   --bootstrap-expect 3 \
-  --server-join-address "10.0.1.2:4647,10.0.1.3:4647" \
+  --server-join-address 10.0.1.2:4647 \
+  --server-join-address 10.0.1.3:4647 \
   --high-latency
 ```
 
 Running twice is safe (idempotent):
 ```bash
 # First run: applies changes
-$ sudo nomad-bootstrapper --version 1.6.0 --role server --bootstrap-expect 3 --high-latency
+$ nomad-bootstrapper --nomad-version 1.6.0 --role server --bootstrap-expect 3 --high-latency
 [INFO] Running phase: ensure-deps
 [INFO] Running phase: setup-repo
 [INFO] Running phase: install
@@ -199,7 +203,7 @@ $ sudo nomad-bootstrapper --version 1.6.0 --role server --bootstrap-expect 3 --h
 [INFO] Nomad bootstrap complete
 
 # Second run: no-op (config unchanged)
-$ sudo nomad-bootstrapper --version 1.6.0 --role server --bootstrap-expect 3 --high-latency
+$ nomad-bootstrapper --nomad-version 1.6.0 --role server --bootstrap-expect 3 --high-latency
 [INFO] Running phase: ensure-deps
 [INFO] Running phase: setup-repo
 [INFO] Running phase: install
@@ -221,7 +225,7 @@ EOF
 
 # Test bootstrap in container
 docker run --rm -it --privileged nomad-test:debian-bookworm \
-  nomad-bootstrapper --version 1.6.0 --role server --bootstrap-expect 1 --dry-run
+  nomad-bootstrapper --nomad-version 1.6.0 --role server --bootstrap-expect 1 --dry-run
 ```
 
 ## Supported Systems

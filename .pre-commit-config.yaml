@@ -51,3 +51,28 @@ repos:
   rev: v0.11.0.1
   hooks:
   - id: shellcheck
+
+# Rust formatting (rustfmt)
+- repo: https://github.com/doublify/pre-commit-rust
+  rev: v1.0
+  hooks:
+  - id: fmt
+    name: rustfmt
+    description: Format Rust code using rustfmt
+    entry: cargo fmt --
+    language: system
+    types: [rust]
+    pass_filenames: false
+
+  - id: clippy
+    name: clippy
+    description: Lint Rust code using clippy
+    entry: cargo clippy --all-targets --all-features -- -D warnings
+    language: system
+    types: [rust]
+    pass_filenames: false
+
+ci:
+  skip:
+  # Skip in CI as these take time and are run separately
+  - clippy

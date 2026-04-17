@@ -4,13 +4,13 @@ This repository contains tools for bootstrapping HashiCorp Nomad in Debian-based
 
 ## Project Overview
 
-**Current state:** Bash implementation (production-ready)  
-**Next phase:** Rust rewrite (4-phase implementation plan documented)
+**Current state:** Rust implementation (active development)
 
 The toolkit ensures:
 - **Idempotency**: Safe to run multiple times without side effects
-- **Robustness**: Type safety and error handling (Rust phase)
-- **Modularity**: Phase-based execution (dependency → repository → installation → verification)
+- **Robustness**: Type safety and error handling via Rust
+- **Modularity**: Phase-based execution (ensure-deps → setup-repo → install → configure → verify)
+- **Auto-escalation**: Privilege escalation via `sudo2` crate (sudo/doas/pkexec)
 - **Minimal dependencies**: Standard tools only (`apt-get`, `curl`, `gpg`, `dpkg`)
 
 ## Key Technical Conventions
@@ -37,27 +37,33 @@ All implementations follow a **state provisioner design** with phase-based execu
 
 ```
 clark/
-├── scripts/                    # Bash implementation
-│   ├── bootstrap_nomad.sh     # Current production script
-│   └── bootstrap_nomad.new    # Alternative/newer version
+├── nomad-bootstrapper/         # Rust implementation (active)
+│   ├── src/
+│   │   ├── main.rs            # CLI args, address validation, entry point
+│   │   ├── models.rs          # NodeConfig, ServerConfig, ClientConfig
+│   │   ├── executor.rs        # DependencyGraph, phase ordering
+│   │   ├── runner.rs          # CommandRunner (real / dry-run)
+│   │   ├── state.rs           # Provisioning state tracking
+│   │   ├── system.rs          # System probes (dpkg, codename, config I/O)
+│   │   └── modules/           # Phase implementations
+│   │       ├── ensure_deps.rs
+│   │       ├── setup_repo.rs
+│   │       ├── install.rs
+│   │       ├── configure.rs
+│   │       └── verify.rs
+│   ├── tests/                 # Integration tests
+│   ├── scripts/               # Docker-based test runner
+│   ├── Cargo.toml
+│   └── README.md
 ├── thoughts/shared/
 │   ├── designs/               # Technical specifications
-│   │   ├── nomad-rust-bootstrapper-design.md
-│   │   └── bootstrap-nomad-extension-design.md
-│   └── plans/
-│       └── nomad-rust-bootstrapper.md (4-phase plan)
+│   └── plans/                 # Implementation plans
 └── .pre-commit-config.yaml    # Code quality standards
 ```
 
 ## Build/Test Commands
 
-### Current (Bash)
-```bash
-# Direct execution (requires sudo/root)
-./scripts/bootstrap_nomad.sh
-```
-
-### Planned Rust Implementation (State Provisioner Model)
+### Rust Implementation
 ```bash
 # Build release binary
 cargo build --release
@@ -68,17 +74,23 @@ cargo test
 # Run integration tests (Docker Debian containers)
 cargo test --features integration
 
-# Default: Bootstrap to desired state (runs all phases: ensure-deps → setup-repo → install → configure → verify)
-sudo ./target/release/nomad-bootstrapper --version 1.6.0 --role server --bootstrap-expect 3 --high-latency
+# Default: Bootstrap to desired state (auto-escalates to root)
+./target/release/nomad-bootstrapper --nomad-version 1.6.0 --role server --bootstrap-expect 3 --high-latency
 
 # For testing: Run only a specific phase
-sudo ./target/release/nomad-bootstrapper --phase ensure-deps
+./target/release/nomad-bootstrapper --phase ensure-deps
 
 # For testing: Run up to a specific phase (includes dependencies)
-sudo ./target/release/nomad-bootstrapper --version 1.6.0 --up-to configure
+./target/release/nomad-bootstrapper --nomad-version 1.6.0 --up-to configure
 
-# Dry-run mode (show what would be done)
-sudo ./target/release/nomad-bootstrapper --version 1.6.0 --role server --dry-run
+# Dry-run mode (show what would be done, skips privilege escalation)
+./target/release/nomad-bootstrapper --nomad-version 1.6.0 --role server --dry-run
+```
+
+### Legacy Bash
+```bash
+# Direct execution (requires sudo/root)
+./scripts/bootstrap_nomad.sh
 ```
 
 ## Documentation Links
@@ -102,7 +114,7 @@ sudo ./target/release/nomad-bootstrapper --version 1.6.0 --role server --dry-run
 
 ### Target Environment
 - **OS**: Debian-based systems only (Debian, Ubuntu, etc.)
-- **Privileges**: Requires root or sudo
+- **Privileges**: Auto-escalates via sudo, doas, or pkexec (sudo2 crate)
 - **Network**: Designed for high-latency environments (>100ms tolerant)
 - **Dependencies**: Minimal and standard (no heavy runtimes)
 
@@ -136,4 +148,4 @@ sudo ./target/release/nomad-bootstrapper --version 1.6.0 --role server --dry-run
 
 ---
 
-*Last updated: April 16, 2026*
+*Last updated: April 17, 2026*
