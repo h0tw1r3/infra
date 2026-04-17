@@ -1,12 +1,34 @@
+mod preflight;
+mod provisioning;
+
 use anyhow::Result;
 use log::info;
 
-use crate::config::{Args, ExecutionConfig, Inventory};
-use crate::debian::DebianHost;
-use crate::executor::{DependencyGraph, PhaseExecutor};
-use crate::models::{ExecutionContext, ResolvedNode};
-use crate::state::ProvisionedState;
-use crate::transport::{RemoteHost, SshTransport, Transport};
+use crate::config::{Args, Inventory};
+use crate::executor::DependencyGraph;
+use crate::models::ResolvedNode;
+use crate::transport::SshTransport;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HostStatus {
+    PreflightPassed,
+    PreflightFailed(String),
+    ProvisioningSucceeded,
+    ProvisioningFailed { phase: String, message: String },
+    GateInvalidated(String),
+    SkippedAfterAbort { after_phase: Option<String> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RunAbortReason {
+    PreflightFailure,
+    GateInvalidation { host: String, message: String },
+    ProvisioningFailure {
+        host: String,
+        phase: String,
+        message: String,
+    },
+}
 
 pub fn run(args: &Args) -> Result<()> {
     let inventory = Inventory::load(&args.inventory)?;
@@ -16,15 +38,6 @@ pub fn run(args: &Args) -> Result<()> {
     let phases = executor.filter_phases(&args.phase, &args.up_to)?;
     let transport = SshTransport::new(args.dry_run)?;
 
-    run_nodes(&nodes, &phases, &transport, execution)
-}
-
-fn run_nodes(
-    nodes: &[ResolvedNode],
-    phases: &[&dyn PhaseExecutor],
-    transport: &dyn Transport,
-    execution: ExecutionConfig,
-) -> Result<()> {
     info!(
         "Starting Nomad controller run for {} host(s) with {} phase(s) and concurrency limit {}",
         nodes.len(),
@@ -32,104 +45,79 @@ fn run_nodes(
         execution.concurrency
     );
 
-    for node in nodes {
-        info!("Starting host: {}", node.target.label());
-        let remote = RemoteHost::new(transport, &node.target);
-        let host = DebianHost::new(remote);
-        host.ensure_supported_platform()?;
-
-        let mut ctx = ExecutionContext::default();
-        ctx.state = ProvisionedState::load_optional(host.remote());
-
-        for phase in phases {
-            info!(
-                "Host {}: starting phase {}",
-                host.remote().label(),
-                phase.name()
-            );
-            let result = phase
-                .execute(&host, &node.config, &mut ctx)
-                .map_err(|err| {
-                    anyhow::anyhow!(
-                        "host {} phase {} failed: {}",
-                        host.remote().label(),
-                        phase.name(),
-                        err
-                    )
-                })?;
-            info!(
-                "Host {}: completed phase {} (changed: {}) - {}",
-                host.remote().label(),
-                result.phase_name,
-                result.changes_made,
-                result.message
-            );
-        }
-
-        ctx.state.save_optional(host.remote());
-        info!("Completed host: {}", host.remote().label());
-    }
+    let statuses = preflight::run(&nodes, &phases, &transport, execution)?;
+    provisioning::run(&nodes, &phases, &transport, execution, statuses)?;
 
     info!("Nomad controller run complete");
     Ok(())
 }
 
+fn render_run_summary(
+    nodes: &[ResolvedNode],
+    statuses: &[HostStatus],
+    abort_reason: Option<&RunAbortReason>,
+) -> String {
+    let mut lines = Vec::new();
+    if let Some(reason) = abort_reason {
+        lines.push(format!("Run aborted: {}", render_abort_reason(reason)));
+    } else {
+        lines.push("Run succeeded".to_string());
+    }
+
+    for (node, status) in nodes.iter().zip(statuses.iter()) {
+        lines.push(format!("{}: {}", node.target.label(), render_host_status(status, abort_reason)));
+    }
+
+    lines.join("\n")
+}
+
+fn render_abort_reason(reason: &RunAbortReason) -> String {
+    match reason {
+        RunAbortReason::PreflightFailure => "preflight failure".to_string(),
+        RunAbortReason::GateInvalidation { host, message } => {
+            format!("gate invalidation on {}: {}", host, message)
+        }
+        RunAbortReason::ProvisioningFailure {
+            host,
+            phase,
+            message,
+        } => format!("provisioning failure on {} during {}: {}", host, phase, message),
+    }
+}
+
+fn render_host_status(status: &HostStatus, abort_reason: Option<&RunAbortReason>) -> String {
+    match status {
+        HostStatus::PreflightPassed => "preflight_passed".to_string(),
+        HostStatus::PreflightFailed(message) => format!("preflight_failed ({})", message),
+        HostStatus::ProvisioningSucceeded => "provisioning_succeeded".to_string(),
+        HostStatus::ProvisioningFailed { phase, message } => {
+            format!("provisioning_failed [{}] ({})", phase, message)
+        }
+        HostStatus::GateInvalidated(message) => format!("gate_invalidated ({})", message),
+        HostStatus::SkippedAfterAbort { after_phase } => {
+            let label = match abort_reason {
+                Some(RunAbortReason::ProvisioningFailure { .. }) => "skipped_after_peer_failure",
+                Some(RunAbortReason::GateInvalidation { .. }) => "skipped_after_abort",
+                _ => "skipped_after_abort",
+            };
+            if let Some(phase) = after_phase {
+                format!("{} (after {})", label, phase)
+            } else {
+                label.to_string()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use super::*;
-    use crate::models::{LatencyProfile, NodeConfig, NodeRole, ResolvedTarget, ServerConfig};
-    use crate::transport::RemoteOutput;
+    use crate::models::{
+        LatencyProfile, NodeConfig, NodeRole, ResolvedTarget, ServerConfig,
+    };
 
-    struct FakeTransport {
-        calls: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl Transport for FakeTransport {
-        fn is_dry_run(&self) -> bool {
-            false
-        }
-
-        fn exec(
-            &self,
-            target: &ResolvedTarget,
-            command: &str,
-            _input: Option<&[u8]>,
-        ) -> Result<RemoteOutput> {
-            self.calls
-                .lock()
-                .expect("calls lock")
-                .push(format!("{}:{}", target.label(), command));
-
-            if command == "cat /etc/os-release" {
-                let stdout = if target.label() == "node-1" {
-                    "ID=ubuntu\nVERSION_CODENAME=jammy\n"
-                } else {
-                    "ID=debian\nVERSION_CODENAME=bookworm\n"
-                };
-                return Ok(RemoteOutput {
-                    status: 0,
-                    stdout: stdout.to_string(),
-                    stderr: String::new(),
-                });
-            }
-
-            Ok(RemoteOutput {
-                status: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-            })
-        }
-    }
-
-    #[test]
-    fn test_controller_stops_on_first_host_failure() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let transport = FakeTransport {
-            calls: Arc::clone(&calls),
-        };
-        let nodes = vec![
+    fn nodes() -> Vec<ResolvedNode> {
+        vec![
             ResolvedNode {
                 target: ResolvedTarget {
                     name: "node-1".to_string(),
@@ -174,20 +162,29 @@ mod tests {
                     latency_profile: LatencyProfile::Standard,
                 },
             },
-        ];
-        let phases: Vec<&dyn PhaseExecutor> = Vec::new();
+        ]
+    }
 
-        let err = run_nodes(
-            &nodes,
-            &phases,
-            &transport,
-            ExecutionConfig { concurrency: 1 },
-        )
-        .expect_err("expected first host failure");
-        assert!(err.to_string().contains("not supported"));
+    #[test]
+    fn test_render_run_summary_orders_hosts_deterministically() {
+        let summary = render_run_summary(
+            &nodes(),
+            &[
+                HostStatus::PreflightPassed,
+                HostStatus::ProvisioningFailed {
+                    phase: "install".to_string(),
+                    message: "boom".to_string(),
+                },
+            ],
+            Some(&RunAbortReason::ProvisioningFailure {
+                host: "node-2".to_string(),
+                phase: "install".to_string(),
+                message: "boom".to_string(),
+            }),
+        );
 
-        let calls = calls.lock().expect("calls lock");
-        assert_eq!(calls.len(), 1);
-        assert!(calls[0].starts_with("node-1:"));
+        assert!(summary.contains("Run aborted: provisioning failure on node-2 during install"));
+        assert!(summary.contains("node-1: preflight_passed"));
+        assert!(summary.contains("node-2: provisioning_failed [install] (boom)"));
     }
 }

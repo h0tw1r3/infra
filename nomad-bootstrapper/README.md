@@ -1,15 +1,16 @@
 # Nomad Bootstrapper
 
-`nomad-bootstrapper` is a controller-led Rust CLI that bootstraps HashiCorp Nomad on **Debian** hosts over **raw SSH**.
+`nomad-bootstrapper` is a controller-led Rust CLI that bootstraps HashiCorp Nomad on **Debian** hosts over **session-managed SSH**.
 
-Instead of installing the tool on every node, you run it once from your control machine with a declarative inventory. The controller connects to each host serially, applies the five provisioning phases, and stops on the first host failure so reruns are explicit and predictable.
+Instead of installing the tool on every node, you run it once from your control machine with a declarative inventory. The controller opens retained SSH sessions to the managed hosts, requires every host to pass a strict preflight gate before provisioning begins, and then applies the provisioning phases with bounded cross-host concurrency while keeping phase order sequential within each host.
 
 ## Features
 
 - **Remote-first**: runs from your laptop, CI runner, or admin box over SSH
 - **Declarative inventory**: cluster topology, Nomad role, and SSH settings live in TOML
+- **Strict fleet preflight**: connectivity, Debian compatibility, and provisioning capability are validated before any mutating phase starts
 - **Hybrid idempotency**: live remote probes are authoritative; an optional node-local state file is advisory only
-- **SSH-friendly defaults**: uses your existing SSH config and agent by default, with global and per-node overrides
+- **Retained SSH sessions**: preflight-established sessions are reused for provisioning, while still honoring global and per-node SSH overrides
 - **Debian-focused**: supports Debian hosts in v1, with a transport/backend split that keeps future host support straightforward
 - **Phase-based converge flow**: ensure-deps -> setup-repo -> install -> configure -> verify
 
@@ -138,22 +139,24 @@ OPTIONS:
 ```text
 inventory.toml
   -> resolve node + SSH settings
-  -> connect to host over ssh
-  -> ensure-deps
-  -> setup-repo
-  -> install
-  -> configure
-  -> verify
-  -> write advisory node-local state file
+  -> open retained ssh sessions
+  -> preflight every host (connectivity, Debian, privileges)
+  -> if all pass:
+       -> run ensure-deps/setup-repo/install/configure/verify
+          with bounded cross-host concurrency
+          and sequential per-host phase order
+  -> close retained ssh sessions
 ```
 
 ### Failure Policy
 
-Version 1 runs hosts **serially** and **stops on the first host failure**.
+Version 1 uses a **strict preflight gate** and **bounded host concurrency**.
 
-- The failing host and phase are reported explicitly
-- Partial host changes are preserved
-- Retry is a normal rerun after fixing the underlying issue
+- If any host fails preflight, the run aborts before provisioning starts
+- If a retained session dies after preflight but before that host begins provisioning, the run aborts with a gate invalidation
+- If one host fails during provisioning, no new hosts start
+- Hosts already running a phase finish that current phase only; remaining phases, including `verify`, are skipped
+- The run reports both a run-level abort reason and per-host outcomes
 
 ### Idempotency Model
 

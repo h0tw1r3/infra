@@ -27,6 +27,9 @@ impl RemoteOutput {
 
 pub trait Transport: Send + Sync {
     fn is_dry_run(&self) -> bool;
+    fn check_session(&self, _target: &ResolvedTarget) -> Result<()> {
+        Ok(())
+    }
     fn exec(
         &self,
         target: &ResolvedTarget,
@@ -168,6 +171,29 @@ impl SshTransport {
 impl Transport for SshTransport {
     fn is_dry_run(&self) -> bool {
         self.dry_run
+    }
+
+    fn check_session(&self, target: &ResolvedTarget) -> Result<()> {
+        if self.dry_run {
+            return Ok(());
+        }
+
+        let key = session_key(target);
+        let session = self
+            .sessions
+            .lock()
+            .expect("SSH sessions lock")
+            .get(&key)
+            .map(|handle| Arc::clone(&handle.session))
+            .ok_or_else(|| anyhow::anyhow!("no retained SSH session exists for {}", target.label()))?;
+
+        let runtime = self.runtime.lock().expect("SSH runtime lock");
+        runtime.block_on(async move {
+            session
+                .check()
+                .await
+                .map_err(|err| anyhow::anyhow!("retained SSH session is unhealthy for {}: {}", target.label(), err))
+        })
     }
 
     fn exec(
