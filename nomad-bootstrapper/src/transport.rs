@@ -418,3 +418,65 @@ fn session_key(target: &ResolvedTarget) -> String {
 pub fn shell_quote(value: &str) -> String {
     shell_escape::unix::escape(value.into()).to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target() -> ResolvedTarget {
+        ResolvedTarget {
+            name: "node-1".to_string(),
+            host: "node-1.example.com".to_string(),
+            user: Some("root".to_string()),
+            identity_file: Some("~/.ssh/id_ed25519".to_string()),
+            port: Some(2222),
+            options: vec!["StrictHostKeyChecking=accept-new".to_string()],
+        }
+    }
+
+    #[test]
+    fn test_build_exec_args_preserves_legacy_ssh_shape() {
+        let args = build_exec_args(&target(), "nomad version");
+
+        assert_eq!(
+            args,
+            vec![
+                "-p".to_string(),
+                "2222".to_string(),
+                "-l".to_string(),
+                "root".to_string(),
+                "-i".to_string(),
+                "~/.ssh/id_ed25519".to_string(),
+                "-o".to_string(),
+                "StrictHostKeyChecking=accept-new".to_string(),
+                "node-1.example.com".to_string(),
+                "sh -lc 'nomad version'".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_master_args_adds_control_master_options() {
+        let args = build_master_args(&target(), Path::new("/tmp/control"));
+
+        assert!(args.contains(&"-f".to_string()));
+        assert!(args.contains(&"-N".to_string()));
+        assert!(args.contains(&"ControlMaster=yes".to_string()));
+        assert!(args.contains(&"ControlPersist=yes".to_string()));
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+        assert!(args.contains(&"ControlPath=/tmp/control".to_string()));
+    }
+
+    #[test]
+    fn test_session_key_changes_with_connection_settings() {
+        let baseline = session_key(&target());
+
+        let mut changed_port = target();
+        changed_port.port = Some(4647);
+        assert_ne!(baseline, session_key(&changed_port));
+
+        let mut changed_option = target();
+        changed_option.options.push("Compression=yes".to_string());
+        assert_ne!(baseline, session_key(&changed_option));
+    }
+}
