@@ -48,14 +48,14 @@ sudo ./target/release/nomad-bootstrapper \
 sudo ./target/release/nomad-bootstrapper \
   --version 1.6.0 \
   --role client \
-  --server-addresses "10.0.1.1:4647"
+  --server-address "10.0.1.1:4647"
 
 # Bootstrap server with high-latency tuning
 sudo ./target/release/nomad-bootstrapper \
   --version 1.6.0 \
   --role server \
   --bootstrap-expect 3 \
-  --server-join-addresses "10.0.1.2:4647,10.0.1.3:4647" \
+  --server-join-address "10.0.1.2:4647,10.0.1.3:4647" \
   --high-latency
 ```
 
@@ -120,11 +120,11 @@ OPTIONS:
     --bootstrap-expect <N>
         For server: number of servers in initial cluster (required for --role server)
 
-    --server-join-addresses <ADDRESSES>
-        For server: comma-separated list of other servers to join (e.g., "10.0.1.2:4647,10.0.1.3:4647")
+    --server-join-address <ADDRESS>
+        For server: another server to join (can be specified multiple times, e.g., --server-join-address 10.0.1.2:4647)
 
-    --server-addresses <ADDRESSES>
-        For client: comma-separated list of server addresses (required for --role client)
+    --server-address <ADDRESS>
+        For client: a Nomad server address (can be specified multiple times, required for --role client)
 
     --high-latency
         Apply tuning for high-latency environments (home internet, satellite, etc.)
@@ -163,7 +163,7 @@ sudo nomad-bootstrapper \
   --version 1.6.0 \
   --role server \
   --bootstrap-expect 3 \
-  --server-join-addresses "10.0.1.1:4647" \
+  --server-join-address "10.0.1.1:4647" \
   --high-latency
 ```
 
@@ -180,7 +180,7 @@ sudo nomad-bootstrapper \
   --version 1.6.0 \
   --role server \
   --bootstrap-expect 3 \
-  --server-join-addresses "10.0.1.2:4647,10.0.1.3:4647" \
+  --server-join-address "10.0.1.2:4647,10.0.1.3:4647" \
   --high-latency
 ```
 

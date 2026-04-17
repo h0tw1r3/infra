@@ -106,7 +106,7 @@ impl NodeConfig {
                     }
 
                     let server_join_addresses = args
-                        .server_join_addresses
+                        .server_join_address
                         .iter()
                         .map(|s| s.trim().to_string())
                         .collect();
@@ -125,12 +125,12 @@ impl NodeConfig {
                 if !require_role && args.role.is_none() {
                     None
                 } else {
-                    if args.server_addresses.is_empty() {
-                        anyhow::bail!("--server-addresses required for client role");
+                    if args.server_address.is_empty() {
+                        anyhow::bail!("--server-address required for client role");
                     }
 
                     let server_addresses = args
-                        .server_addresses
+                        .server_address
                         .iter()
                         .map(|s| s.trim().to_string())
                         .collect();
@@ -212,8 +212,8 @@ mod tests {
             nomad_version: "1.6.0".to_string(),
             role: Some("server".to_string()),
             bootstrap_expect: Some(1),
-            server_join_addresses: Vec::new(),
-            server_addresses: Vec::new(),
+            server_join_address: Vec::new(),
+            server_address: Vec::new(),
             high_latency: false,
             phase: None,
             up_to: None,
@@ -276,14 +276,14 @@ mod tests {
         let mut args = base_args();
         args.role = Some("client".to_string());
         args.bootstrap_expect = None;
-        args.server_addresses = Vec::new();
+        args.server_address = Vec::new();
 
         let result = NodeConfig::from_args_with_role_requirement(&args, true);
         assert!(result.is_err());
         assert!(result
             .expect_err("expected error")
             .to_string()
-            .contains("--server-addresses"));
+            .contains("--server-address"));
     }
 
     #[test]

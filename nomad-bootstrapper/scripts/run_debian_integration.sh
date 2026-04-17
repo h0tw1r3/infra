@@ -102,8 +102,8 @@ log "Running client mode provisioning with server addresses"
 ./target/release/nomad-bootstrapper \
   --nomad-version latest \
   --role client \
-  --server-addresses 10.0.1.1:4647 \
-  --server-addresses 10.0.1.2:4647 \
+  --server-address 10.0.1.1:4647 \
+  --server-address 10.0.1.2:4647 \
   --up-to configure \
   --log-level info
 
@@ -122,8 +122,8 @@ client_first=$(sha256sum /etc/nomad.d/nomad.hcl | awk "{print \$1}")
 ./target/release/nomad-bootstrapper \
   --nomad-version latest \
   --role client \
-  --server-addresses 10.0.1.1:4647 \
-  --server-addresses 10.0.1.2:4647 \
+  --server-address 10.0.1.1:4647 \
+  --server-address 10.0.1.2:4647 \
   --up-to configure \
   --log-level info
 client_second=$(sha256sum /etc/nomad.d/nomad.hcl | awk "{print \$1}")
