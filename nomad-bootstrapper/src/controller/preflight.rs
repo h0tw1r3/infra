@@ -62,7 +62,12 @@ pub(super) fn run(
     {
         anyhow::bail!(
             "{}",
-            render_run_summary(nodes, &statuses, Some(&RunAbortReason::PreflightFailure))
+            render_run_summary(
+                nodes,
+                phases,
+                &statuses,
+                Some(&RunAbortReason::PreflightFailure)
+            )
         );
     }
 

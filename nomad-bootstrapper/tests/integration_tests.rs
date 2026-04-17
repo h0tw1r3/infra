@@ -125,6 +125,37 @@ mod tests {
     }
 
     #[test]
+    fn test_success_summary_is_visible_at_warn_log_level() {
+        let (_dir, inventory) = write_inventory(
+            r#"
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            role = "server"
+            bootstrap_expect = 1
+            nomad_version = "latest"
+        "#,
+        );
+
+        let output = Command::new(bin_path())
+            .args([
+                "--inventory",
+                inventory.to_str().expect("inventory path"),
+                "--dry-run",
+                "--log-level",
+                "warn",
+            ])
+            .output()
+            .expect("run dry-run with warn logging");
+        assert!(output.status.success(), "{:?}", output);
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Run succeeded"));
+        assert!(stdout.contains("queued_for_provisioning"));
+        assert!(stdout.contains("running_phase(ensure-deps)"));
+    }
+
+    #[test]
     fn test_zero_concurrency_is_rejected() {
         let (_dir, inventory) = write_inventory(
             r#"

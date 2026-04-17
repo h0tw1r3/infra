@@ -71,9 +71,12 @@ pub(super) fn run(
     }
 
     match abort_reason {
-        Some(reason) => anyhow::bail!("{}", render_run_summary(nodes, &statuses, Some(&reason))),
+        Some(reason) => anyhow::bail!(
+            "{}",
+            render_run_summary(nodes, phases, &statuses, Some(&reason))
+        ),
         None => {
-            info!("{}", render_run_summary(nodes, &statuses, None));
+            println!("{}", render_run_summary(nodes, phases, &statuses, None));
             Ok(())
         }
     }
@@ -384,6 +387,66 @@ mod tests {
                 .expect("calls lock")
                 .iter()
                 .any(|entry| entry == "node-2:phase-two")
+        );
+    }
+
+    struct TrackingPhase {
+        name: &'static str,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PhaseExecutor for TrackingPhase {
+        fn execute(
+            &self,
+            host: &DebianHost<'_>,
+            _config: &NodeConfig,
+            _ctx: &mut ExecutionContext,
+        ) -> Result<PhaseResult> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(format!("{}:{}", host.remote().label(), self.name));
+            Ok(PhaseResult::unchanged(self.name, "ok"))
+        }
+
+        fn name(&self) -> &'static str {
+            self.name
+        }
+    }
+
+    #[test]
+    fn test_serial_provisioning_preserves_host_then_phase_order() {
+        let nodes = nodes();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let phase_one = TrackingPhase {
+            name: "phase-one",
+            calls: Arc::clone(&calls),
+        };
+        let phase_two = TrackingPhase {
+            name: "phase-two",
+            calls: Arc::clone(&calls),
+        };
+        let phases: Vec<&dyn PhaseExecutor> = vec![&phase_one, &phase_two];
+
+        run(
+            &nodes,
+            &phases,
+            &FakeTransport {
+                invalidated_host: None,
+            },
+            ExecutionConfig { concurrency: 1 },
+            vec![HostStatus::PreflightPassed; 2],
+        )
+        .expect("serial provisioning should succeed");
+
+        assert_eq!(
+            *calls.lock().expect("calls lock"),
+            vec![
+                "node-1:phase-one".to_string(),
+                "node-1:phase-two".to_string(),
+                "node-2:phase-one".to_string(),
+                "node-2:phase-two".to_string(),
+            ]
         );
     }
 }

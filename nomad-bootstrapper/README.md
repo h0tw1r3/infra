@@ -156,7 +156,8 @@ Version 1 uses a **strict preflight gate** and **bounded host concurrency**.
 - If a retained session dies after preflight but before that host begins provisioning, the run aborts with a gate invalidation
 - If one host fails during provisioning, no new hosts start
 - Hosts already running a phase finish that current phase only; remaining phases, including `verify`, are skipped
-- The run reports both a run-level abort reason and per-host outcomes
+- The final run summary is always printed, even when info logs are disabled
+- Per-host outcomes include the observed state progression through preflight and provisioning
 
 ### Idempotency Model
 
