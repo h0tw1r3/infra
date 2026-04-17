@@ -14,7 +14,7 @@ pub fn run(args: &Args) -> Result<()> {
     let execution = inventory.resolve_execution(args, nodes.len())?;
     let executor = DependencyGraph::new();
     let phases = executor.filter_phases(&args.phase, &args.up_to)?;
-    let transport = SshTransport::new(args.dry_run);
+    let transport = SshTransport::new(args.dry_run)?;
 
     run_nodes(&nodes, &phases, &transport, execution)
 }

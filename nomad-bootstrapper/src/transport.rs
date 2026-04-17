@@ -1,9 +1,14 @@
-use std::io::Write;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio as ProcessStdio};
+use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
-use log::{debug, info};
+use anyhow::{Context, Result};
+use log::{debug, info, warn};
+use openssh::{Session, Stdio};
+use tempfile::{Builder as TempDirBuilder, TempDir};
+use tokio::io::AsyncWriteExt;
+use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 use crate::models::ResolvedTarget;
 
@@ -30,13 +35,133 @@ pub trait Transport: Send + Sync {
     ) -> Result<RemoteOutput>;
 }
 
+struct SessionHandle {
+    session: Arc<Session>,
+    control_dir: TempDir,
+    control_path: PathBuf,
+    host: String,
+}
+
 pub struct SshTransport {
     dry_run: bool,
+    runtime: Mutex<Runtime>,
+    sessions: Mutex<HashMap<String, SessionHandle>>,
 }
 
 impl SshTransport {
-    pub fn new(dry_run: bool) -> Self {
-        Self { dry_run }
+    pub fn new(dry_run: bool) -> Result<Self> {
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create SSH runtime")?;
+
+        Ok(Self {
+            dry_run,
+            runtime: Mutex::new(runtime),
+            sessions: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn get_or_connect_session(&self, target: &ResolvedTarget) -> Result<Arc<Session>> {
+        let key = session_key(target);
+        if let Some(handle) = self
+            .sessions
+            .lock()
+            .expect("SSH sessions lock")
+            .get(&key)
+        {
+            return Ok(Arc::clone(&handle.session));
+        }
+
+        let handle = self.connect_session(target)?;
+        let session = Arc::clone(&handle.session);
+
+        let mut sessions = self.sessions.lock().expect("SSH sessions lock");
+        if let Some(existing) = sessions.get(&key) {
+            return Ok(Arc::clone(&existing.session));
+        }
+
+        sessions.insert(key, handle);
+        Ok(session)
+    }
+
+    fn connect_session(&self, target: &ResolvedTarget) -> Result<SessionHandle> {
+        let control_dir = TempDirBuilder::new()
+            .prefix("nomad-bootstrapper-ssh.")
+            .tempdir()
+            .context("failed to create SSH control directory")?;
+        let control_path = control_dir.path().join("control");
+        let launch_args = build_master_args(target, &control_path);
+
+        debug!("Establishing SSH session for {}", target.label());
+        let output = Command::new("ssh")
+            .args(&launch_args)
+            .stdin(ProcessStdio::null())
+            .stdout(ProcessStdio::piped())
+            .stderr(ProcessStdio::piped())
+            .output()
+            .map_err(|err| anyhow::anyhow!("failed to start ssh session for {}: {}", target.label(), err))?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "failed to establish ssh session for {} (exit {}): stdout: {} stderr: {}",
+                target.label(),
+                output.status.code().unwrap_or(255),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        if !control_path.exists() {
+            anyhow::bail!(
+                "failed to establish ssh session for {}: control socket was not created",
+                target.label()
+            );
+        }
+
+        Ok(SessionHandle {
+            session: Arc::new(Session::resume(control_path.clone().into_boxed_path(), None)),
+            control_dir,
+            control_path,
+            host: target.host.clone(),
+        })
+    }
+
+    fn close_all_sessions(&self) {
+        let handles = {
+            let mut sessions = self.sessions.lock().expect("SSH sessions lock");
+            sessions.drain().map(|(_, handle)| handle).collect::<Vec<_>>()
+        };
+
+        if handles.is_empty() {
+            return;
+        }
+
+        let runtime = self.runtime.lock().expect("SSH runtime lock");
+        for handle in handles {
+            let SessionHandle {
+                session,
+                control_dir,
+                control_path,
+                host,
+            } = handle;
+
+            let close_result = match Arc::try_unwrap(session) {
+                Ok(session) => runtime.block_on(session.close()).map_err(|err| err.into()),
+                Err(_) => close_master_process(&control_path, &host),
+            };
+
+            if let Err(err) = close_result {
+                warn!(
+                    "failed to close SSH session for {} using {}: {}",
+                    host,
+                    control_path.display(),
+                    err
+                );
+            }
+
+            drop(control_dir);
+        }
     }
 }
 
@@ -51,31 +176,13 @@ impl Transport for SshTransport {
         command: &str,
         input: Option<&[u8]>,
     ) -> Result<RemoteOutput> {
-        let mut args = Vec::new();
-        if let Some(port) = target.port {
-            args.push("-p".to_string());
-            args.push(port.to_string());
-        }
-        if let Some(user) = &target.user {
-            args.push("-l".to_string());
-            args.push(user.clone());
-        }
-        if let Some(identity_file) = &target.identity_file {
-            args.push("-i".to_string());
-            args.push(identity_file.clone());
-        }
-        for option in &target.options {
-            args.push("-o".to_string());
-            args.push(option.clone());
-        }
-        args.push(target.host.clone());
-        args.push(format!("sh -lc {}", shell_quote(command)));
-
+        let exec_args = build_exec_args(target, command);
         if self.dry_run {
             info!(
                 "[DRY RUN:{}] ssh {}",
                 target.label(),
-                args.iter()
+                exec_args
+                    .iter()
                     .map(|value| shell_quote(value))
                     .collect::<Vec<_>>()
                     .join(" ")
@@ -87,34 +194,60 @@ impl Transport for SshTransport {
             });
         }
 
-        debug!("Executing over SSH on {}: {}", target.label(), command);
-        let mut child = Command::new("ssh")
-            .args(&args)
-            .stdin(if input.is_some() {
-                Stdio::piped()
+        let session = self.get_or_connect_session(target)?;
+        debug!(
+            "Executing over retained SSH session on {}: {}",
+            target.label(),
+            command
+        );
+
+        let runtime = self.runtime.lock().expect("SSH runtime lock");
+        runtime.block_on(async move {
+            let mut remote_command = session.shell(command);
+            let output = if let Some(input) = input {
+                remote_command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+
+                let mut child = remote_command.spawn().await.map_err(|err| {
+                    anyhow::anyhow!("failed to start remote command for {}: {}", target.label(), err)
+                })?;
+                let mut stdin = child.stdin().take().ok_or_else(|| {
+                    anyhow::anyhow!("failed to open remote stdin for {}", target.label())
+                })?;
+                stdin
+                    .write_all(input)
+                    .await
+                    .with_context(|| format!("failed to write remote stdin for {}", target.label()))?;
+                drop(stdin);
+                child.wait_with_output().await.map_err(|err| {
+                    anyhow::anyhow!(
+                        "failed to collect remote command output for {}: {}",
+                        target.label(),
+                        err
+                    )
+                })?
             } else {
-                Stdio::null()
+                remote_command.output().await.map_err(|err| {
+                    anyhow::anyhow!("failed to run remote command for {}: {}", target.label(), err)
+                })?
+            };
+
+            Ok(RemoteOutput {
+                status: output.status.code().unwrap_or(255),
+                stdout: String::from_utf8(output.stdout)
+                    .context("remote stdout was not valid UTF-8")?,
+                stderr: String::from_utf8(output.stderr)
+                    .context("remote stderr was not valid UTF-8")?,
             })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| {
-                anyhow::anyhow!("failed to start ssh for {}: {}", target.label(), err)
-            })?;
-
-        if let Some(input) = input {
-            let stdin = child.stdin.as_mut().ok_or_else(|| {
-                anyhow::anyhow!("failed to open ssh stdin for {}", target.label())
-            })?;
-            stdin.write_all(input)?;
-        }
-
-        let output = child.wait_with_output()?;
-        Ok(RemoteOutput {
-            status: output.status.code().unwrap_or(255),
-            stdout: String::from_utf8(output.stdout)?,
-            stderr: String::from_utf8(output.stderr)?,
         })
+    }
+}
+
+impl Drop for SshTransport {
+    fn drop(&mut self) {
+        self.close_all_sessions();
     }
 }
 
@@ -199,6 +332,86 @@ fn ensure_success(host: &str, command: &str, output: &RemoteOutput) -> Result<()
         command,
         output.stdout.trim(),
         output.stderr.trim()
+    )
+}
+
+fn build_exec_args(target: &ResolvedTarget, command: &str) -> Vec<String> {
+    let mut args = ssh_target_args(target);
+    args.push(target.host.clone());
+    args.push(format!("sh -lc {}", shell_quote(command)));
+    args
+}
+
+fn build_master_args(target: &ResolvedTarget, control_path: &Path) -> Vec<String> {
+    let mut args = ssh_target_args(target);
+    args.push("-o".to_string());
+    args.push("BatchMode=yes".to_string());
+    args.push("-o".to_string());
+    args.push("ControlMaster=yes".to_string());
+    args.push("-o".to_string());
+    args.push(format!("ControlPath={}", control_path.display()));
+    args.push("-o".to_string());
+    args.push("ControlPersist=yes".to_string());
+    args.push("-f".to_string());
+    args.push("-N".to_string());
+    args.push(target.host.clone());
+    args
+}
+
+fn ssh_target_args(target: &ResolvedTarget) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(port) = target.port {
+        args.push("-p".to_string());
+        args.push(port.to_string());
+    }
+    if let Some(user) = &target.user {
+        args.push("-l".to_string());
+        args.push(user.clone());
+    }
+    if let Some(identity_file) = &target.identity_file {
+        args.push("-i".to_string());
+        args.push(identity_file.clone());
+    }
+    for option in &target.options {
+        args.push("-o".to_string());
+        args.push(option.clone());
+    }
+    args
+}
+
+fn close_master_process(control_path: &Path, host: &str) -> Result<()> {
+    let output = Command::new("ssh")
+        .arg("-S")
+        .arg(control_path)
+        .arg("-O")
+        .arg("exit")
+        .arg(host)
+        .stdin(ProcessStdio::null())
+        .stdout(ProcessStdio::piped())
+        .stderr(ProcessStdio::piped())
+        .output()
+        .context("failed to execute ssh control exit")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "ssh control exit failed (exit {}): stdout: {} stderr: {}",
+            output.status.code().unwrap_or(255),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(())
+}
+
+fn session_key(target: &ResolvedTarget) -> String {
+    format!(
+        "{}\u{1f}|{}\u{1f}|{}\u{1f}|{}\u{1f}|{}",
+        target.host,
+        target.user.as_deref().unwrap_or_default(),
+        target.port.map(|value| value.to_string()).unwrap_or_default(),
+        target.identity_file.as_deref().unwrap_or_default(),
+        target.options.join("\u{1e}")
     )
 }
 
