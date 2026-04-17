@@ -182,9 +182,11 @@ fn main() -> Result<()> {
     let config = NodeConfig::from_args_with_role_requirement(&args, requires_role_config)?;
     info!("Configuration: {:?}", config);
 
-    // Validate root privileges before making system changes.
-    if !system::is_root() {
-        anyhow::bail!("This tool must be run as root or with sudo");
+    // Escalate to root if needed (supports sudo, doas, pkexec).
+    // Placed after validation so argument errors are reported without prompting.
+    if !args.dry_run {
+        sudo2::escalate_if_needed()
+            .map_err(|e| anyhow::anyhow!("failed to escalate privileges: {}", e))?;
     }
 
     // Create command runner

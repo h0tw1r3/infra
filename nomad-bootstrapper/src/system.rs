@@ -8,11 +8,6 @@ pub const NOMAD_CONFIG_PATH: &str = "/etc/nomad.d/nomad.hcl";
 pub const HASHICORP_KEYRING_PATH: &str = "/usr/share/keyrings/hashicorp-archive-keyring.gpg";
 pub const HASHICORP_SOURCE_LIST_PATH: &str = "/etc/apt/sources.list.d/hashicorp.list";
 
-/// Check if running as root
-pub fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
-}
-
 /// Check if a package is installed via dpkg
 pub fn check_pkg(pkg: &str) -> bool {
     std::process::Command::new("dpkg")

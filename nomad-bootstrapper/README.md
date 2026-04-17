@@ -18,7 +18,7 @@ A robust, idempotent state provisioner for bootstrapping HashiCorp Nomad on Debi
 
 - macOS, Linux, or WSL2
 - Rust 1.70+ (install via [rustup](https://rustup.rs/))
-- sudo/root access on target Debian system
+- Root access on target Debian system (via `sudo`, `doas`, or `pkexec`)
 
 See [SETUP.md](SETUP.md) for detailed installation instructions.
 
@@ -37,21 +37,23 @@ cargo build --release
 
 ### Basic Usage
 
+The tool automatically escalates to root when needed using `sudo`, `doas`, or `pkexec` — no need to prefix with `sudo` yourself.
+
 ```bash
 # Bootstrap a new server (first node in cluster)
-sudo ./target/release/nomad-bootstrapper \
+./target/release/nomad-bootstrapper \
   --version 1.6.0 \
   --role server \
   --bootstrap-expect 1
 
 # Bootstrap a client
-sudo ./target/release/nomad-bootstrapper \
+./target/release/nomad-bootstrapper \
   --version 1.6.0 \
   --role client \
   --server-address "10.0.1.1:4647"
 
 # Bootstrap server with high-latency tuning
-sudo ./target/release/nomad-bootstrapper \
+./target/release/nomad-bootstrapper \
   --version 1.6.0 \
   --role server \
   --bootstrap-expect 3 \
