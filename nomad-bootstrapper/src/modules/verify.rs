@@ -1,43 +1,39 @@
-/// Verify Nomad installation
+use anyhow::Result;
+
+use crate::debian::DebianHost;
 use crate::executor::PhaseExecutor;
 use crate::models::{ExecutionContext, NodeConfig, PhaseResult};
-use crate::runner::CommandRunner;
-use anyhow::Result;
 
 pub struct Verify;
 
 impl PhaseExecutor for Verify {
     fn execute(
         &self,
-        runner: &CommandRunner,
+        host: &DebianHost<'_>,
         config: &NodeConfig,
         ctx: &mut ExecutionContext,
     ) -> Result<PhaseResult> {
         let mut actions = Vec::new();
 
         if ctx.restart_required() {
-            runner.run("systemctl", &["restart", "nomad"])?;
+            host.restart_nomad()?;
             ctx.clear_restart_required();
             actions.push("restarted nomad service".to_string());
         }
 
-        let version_output = runner.run_output("nomad", &["version"])?;
-        if !version_output.is_empty()
-            && config.version != "latest"
-            && !version_output.contains(&config.version)
-        {
+        let version_output = host.nomad_version_output()?;
+        if config.version != "latest" && !version_output.contains(&config.version) {
             anyhow::bail!(
                 "installed nomad version does not match requested version {}: {}",
                 config.version,
-                version_output
+                version_output.trim()
             );
         }
-
         actions.push("verified nomad version".to_string());
 
         Ok(PhaseResult {
             phase_name: self.name().to_string(),
-            changes_made: actions.iter().any(|action| action.contains("restarted")),
+            changes_made: actions.iter().any(|entry| entry.contains("restarted")),
             message: actions.join(", "),
         })
     }

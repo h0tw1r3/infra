@@ -23,6 +23,7 @@ thiserror = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.8"
 sudo2 = "0.2"
+shell-escape = "0.1"
 
 [dev-dependencies]
 mockall = "0.12"

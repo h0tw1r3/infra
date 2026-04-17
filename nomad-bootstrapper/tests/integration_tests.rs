@@ -1,14 +1,21 @@
-//! Integration tests for nomad-bootstrapper
-//!
-//! These tests validate the bootstrapper behavior in realistic scenarios.
-//! Many are designed to run in Docker containers for isolated testing.
+//! Integration tests for nomad-bootstrapper.
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::process::Command;
+
+    use tempfile::{tempdir, TempDir};
 
     fn bin_path() -> &'static str {
         env!("CARGO_BIN_EXE_nomad-bootstrapper")
+    }
+
+    fn write_inventory(contents: &str) -> (TempDir, std::path::PathBuf) {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("inventory.toml");
+        fs::write(&path, contents).expect("write inventory");
+        (dir, path)
     }
 
     #[test]
@@ -20,7 +27,8 @@ mod tests {
         assert!(output.status.success());
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("Bootstrap and configure Nomad"));
+        assert!(stdout.contains("Bootstrap Nomad on Debian hosts over SSH"));
+        assert!(stdout.contains("--inventory"));
         assert!(stdout.contains("--phase"));
     }
 
@@ -38,14 +46,24 @@ mod tests {
 
     #[test]
     fn test_phase_and_up_to_conflict_is_rejected() {
+        let (_dir, inventory) = write_inventory(
+            r#"
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            role = "server"
+            bootstrap_expect = 1
+        "#,
+        );
+
         let output = Command::new(bin_path())
             .args([
+                "--inventory",
+                inventory.to_str().expect("inventory path"),
                 "--phase",
                 "ensure-deps",
                 "--up-to",
                 "verify",
-                "--log-level",
-                "info",
             ])
             .output()
             .expect("run conflict flags");
@@ -56,14 +74,47 @@ mod tests {
     }
 
     #[test]
-    fn test_configure_phase_requires_role_details() {
+    fn test_invalid_inventory_is_rejected() {
+        let (_dir, inventory) = write_inventory(
+            r#"
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            role = "server"
+        "#,
+        );
+
         let output = Command::new(bin_path())
-            .args(["--phase", "configure"])
+            .args(["--inventory", inventory.to_str().expect("inventory path")])
             .output()
-            .expect("run configure without role");
+            .expect("run invalid inventory");
         assert!(!output.status.success());
 
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("--role must be specified"));
+        assert!(stderr.contains("bootstrap_expect"));
+    }
+
+    #[test]
+    fn test_dry_run_with_valid_inventory_succeeds() {
+        let (_dir, inventory) = write_inventory(
+            r#"
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            role = "server"
+            bootstrap_expect = 1
+            nomad_version = "latest"
+        "#,
+        );
+
+        let output = Command::new(bin_path())
+            .args([
+                "--inventory",
+                inventory.to_str().expect("inventory path"),
+                "--dry-run",
+            ])
+            .output()
+            .expect("run dry-run");
+        assert!(output.status.success(), "{:?}", output);
     }
 }
