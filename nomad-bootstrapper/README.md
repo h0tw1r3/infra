@@ -1,313 +1,159 @@
 # Nomad Bootstrapper
 
-A robust, idempotent state provisioner for bootstrapping HashiCorp Nomad on Debian-based Linux systems.
+`nomad-bootstrapper` is a controller-led Rust CLI that bootstraps HashiCorp Nomad on **Debian** hosts over **raw SSH**.
+
+Instead of installing the tool on every node, you run it once from your control machine with a declarative inventory. The controller connects to each host serially, applies the five provisioning phases, and stops on the first host failure so reruns are explicit and predictable.
 
 ## Features
 
-- ✅ **Idempotent**: Safe to run multiple times without side effects
-- ✅ **State Provisioner Model**: Converges system from current state to desired state
-- ✅ **Phase-Based Architecture**: Explicit dependency ordering (ensure-deps → setup-repo → install → configure → verify)
-- ✅ **Type-Safe**: Written in Rust for robustness and performance
-- ✅ **High-Latency Tuning**: Optimized for home internet and other high-latency environments
-- ✅ **Configuration Management**: Idempotent configuration generation and deployment
-- ✅ **Comprehensive Testing**: Unit and integration tests with ≥70% code coverage
+- **Remote-first**: runs from your laptop, CI runner, or admin box over SSH
+- **Declarative inventory**: cluster topology, Nomad role, and SSH settings live in TOML
+- **Hybrid idempotency**: live remote probes are authoritative; an optional node-local state file is advisory only
+- **SSH-friendly defaults**: uses your existing SSH config and agent by default, with global and per-node overrides
+- **Debian-focused**: supports Debian hosts in v1, with a transport/backend split that keeps future host support straightforward
+- **Phase-based converge flow**: ensure-deps -> setup-repo -> install -> configure -> verify
 
-## Quick Start
+## Requirements
 
-### Prerequisites
+- Rust 1.70+
+- `ssh` available on the control machine
+- SSH access to each target host
+- Debian on every managed node
+- Remote privilege escalation already handled by the SSH account you use (for example, logging in as `root`)
 
-- macOS, Linux, or WSL2
-- Rust 1.70+ (install via [rustup](https://rustup.rs/))
-- Root access on target Debian system (via `sudo`, `doas`, or `pkexec`)
-
-See [SETUP.md](SETUP.md) for detailed installation instructions.
-
-### Installation
+## Build and Test
 
 ```bash
-# Clone and navigate to project
-cd /Users/jeffrey.clark/dev/github/clark/nomad-bootstrapper
-
-# Build release binary
 cargo build --release
-
-# Binary location
-./target/release/nomad-bootstrapper --version
+cargo test
+cargo clippy -- -D warnings
 ```
 
-### Basic Usage
-
-The tool automatically escalates to root when needed using `sudo`, `doas`, or `pkexec` — no need to prefix with `sudo` yourself.
+For the containerized smoke test:
 
 ```bash
-# Bootstrap a new server (first node in cluster)
-./target/release/nomad-bootstrapper \
-  --nomad-version 1.6.0 \
-  --role server \
-  --bootstrap-expect 1
+./scripts/run_debian_integration.sh
+```
 
-# Bootstrap a client
-./target/release/nomad-bootstrapper \
-  --nomad-version 1.6.0 \
-  --role client \
-  --server-address 10.0.1.1:4647
+## Inventory Format
 
-# Bootstrap server with high-latency tuning
+The controller reads a TOML inventory file.
+
+```toml
+[cluster]
+datacenter = "homelab"
+
+[defaults]
+nomad_version = "latest"
+high_latency = true
+
+[ssh]
+user = "root"
+identity_file = "~/.ssh/id_ed25519"
+options = ["StrictHostKeyChecking=accept-new"]
+
+[[nodes]]
+name = "server-1"
+host = "server-1.example.com"
+role = "server"
+bootstrap_expect = 3
+server_join_address = ["10.0.1.2:4648", "10.0.1.3:4648"]
+
+[[nodes]]
+name = "client-1"
+host = "client-1.example.com"
+role = "client"
+server_address = ["10.0.1.1:4647", "10.0.1.2:4647"]
+
+[nodes.ssh]
+user = "admin"
+```
+
+### Inventory Rules
+
+- `[[nodes]]` must contain at least one host
+- `role = "server"` requires `bootstrap_expect`
+- `role = "client"` requires at least one `server_address`
+- SSH settings resolve as:
+  1. your existing SSH agent/config when no override is provided
+  2. global `[ssh]` defaults
+  3. per-node `[nodes.ssh]` overrides
+
+## Usage
+
+```bash
+# Full converge run
+./target/release/nomad-bootstrapper --inventory ./inventory.toml
+
+# Run only one phase for every host
 ./target/release/nomad-bootstrapper \
-  --nomad-version 1.6.0 \
-  --role server \
-  --bootstrap-expect 3 \
-  --server-join-address 10.0.1.2:4647 \
-  --server-join-address 10.0.1.3:4647 \
-  --high-latency
+  --inventory ./inventory.toml \
+  --phase configure
+
+# Run through verify in dry-run mode
+./target/release/nomad-bootstrapper \
+  --inventory ./inventory.toml \
+  --dry-run
+```
+
+### CLI Options
+
+```text
+USAGE:
+    nomad-bootstrapper --inventory <PATH> [OPTIONS]
+
+OPTIONS:
+    --inventory <PATH>
+        Path to the inventory TOML file
+
+    --phase <PHASE>
+        Run only this phase: ensure-deps, setup-repo, install, configure, verify
+
+    --up-to <PHASE>
+        Run every phase up to and including the named phase
+
+    --dry-run
+        Show what would be executed without changing remote hosts
+
+    --log-level <LEVEL>
+        debug, info, warn, error
 ```
 
 ## Architecture
 
-### State Provisioner Model
+### Controller Flow
 
-Unlike command-line tools that run a specific command once, this tool operates as a **state provisioner**:
-
-1. You specify the **desired state**: version, role, configuration options
-2. The tool checks the **current state** of the system
-3. It executes only the **necessary phases** to reach the desired state
-4. Running multiple times is **safe and idempotent**
-
-### Phase Dependency Graph
-
-```
-ensure-deps
-    ↓
-setup-repo
-    ↓
-install
-    ↓
-configure
-    ↓
-verify
+```text
+inventory.toml
+  -> resolve node + SSH settings
+  -> connect to host over ssh
+  -> ensure-deps
+  -> setup-repo
+  -> install
+  -> configure
+  -> verify
+  -> write advisory node-local state file
 ```
 
-Each phase:
-- Checks if its work is already done
-- Skips work if unnecessary
-- Provides clear logging of what changed
+### Failure Policy
 
-### Configuration Idempotency
+Version 1 runs hosts **serially** and **stops on the first host failure**.
 
-The configure phase avoids unnecessary service restarts:
+- The failing host and phase are reported explicitly
+- Partial host changes are preserved
+- Retry is a normal rerun after fixing the underlying issue
 
-```
-Current Config (on disk) = read /etc/nomad.d/nomad.hcl
-Desired Config (generated) = generate from --role, --bootstrap-expect, etc.
+### Idempotency Model
 
-if Current == Desired:
-    log "Configuration already matches desired state"
-    skip systemctl restart
-else:
-    apply new configuration and restart service
-```
+The controller does not trust the node-local state file as the source of truth.
 
-## Command-Line Options
+- **Authoritative**: live probes over SSH (`dpkg`, `/etc/os-release`, current Nomad config, etc.)
+- **Advisory**: `/etc/nomad.d/.provisioned.toml` for last converge metadata
 
-```
-USAGE:
-    nomad-bootstrapper [OPTIONS]
+If the advisory state file is missing, stale, unreadable, unwritable, or contradictory, the controller logs and continues using live probe results.
 
-OPTIONS:
-    --nomad-version <VERSION>
-        Nomad version to install (default: latest)
-        Use "latest" to install/upgrade to the newest available package
+## Debian-Only Scope
 
-    --role <ROLE>
-        Node role: server or client
-        Required when running the configure phase
+This rewrite supports **Debian** only. Ubuntu and other Debian-like systems are intentionally out of scope for v1.
 
-    --bootstrap-expect <N>
-        For server: number of servers in initial cluster (required for --role server)
-
-    --server-join-address <ADDRESS>
-        For server: another server to join (can be specified multiple times)
-
-    --server-address <ADDRESS>
-        For client: a Nomad server address (can be specified multiple times, required for --role client)
-
-    --high-latency
-        Apply tuning for high-latency environments (home internet, satellite, etc.)
-
-    --phase <PHASE>
-        Run only this phase: ensure-deps, setup-repo, install, configure, or verify
-        Useful for testing and debugging
-
-    --up-to <PHASE>
-        Run all phases up to and including this one
-        Respects phase dependencies
-
-    --dry-run
-        Show what would be done without making changes
-
-    --log-level <LEVEL>
-        Set logging level: debug, info, warn, error (default: info)
-```
-
-## Examples
-
-### Fresh Server Cluster (3 nodes)
-
-**Node 1 (bootstrap node):**
-```bash
-nomad-bootstrapper \
-  --nomad-version 1.6.0 \
-  --role server \
-  --bootstrap-expect 3 \
-  --high-latency
-```
-
-**Node 2 & 3 (join existing cluster):**
-```bash
-nomad-bootstrapper \
-  --nomad-version 1.6.0 \
-  --role server \
-  --bootstrap-expect 3 \
-  --server-join-address 10.0.1.1:4647 \
-  --high-latency
-```
-
-### Reconfigure Existing Node
-
-Change from standalone server to cluster member:
-
-```bash
-# Original: Single server
-nomad-bootstrapper --nomad-version 1.6.0 --role server --bootstrap-expect 1
-
-# Later: Join 3-node cluster
-nomad-bootstrapper \
-  --nomad-version 1.6.0 \
-  --role server \
-  --bootstrap-expect 3 \
-  --server-join-address 10.0.1.2:4647 \
-  --server-join-address 10.0.1.3:4647 \
-  --high-latency
-```
-
-Running twice is safe (idempotent):
-```bash
-# First run: applies changes
-$ nomad-bootstrapper --nomad-version 1.6.0 --role server --bootstrap-expect 3 --high-latency
-[INFO] Running phase: ensure-deps
-[INFO] Running phase: setup-repo
-[INFO] Running phase: install
-[INFO] Running phase: configure
-[DEBUG] Configuration differs, applying changes
-[INFO] Running phase: verify
-[INFO] Nomad bootstrap complete
-
-# Second run: no-op (config unchanged)
-$ nomad-bootstrapper --nomad-version 1.6.0 --role server --bootstrap-expect 3 --high-latency
-[INFO] Running phase: ensure-deps
-[INFO] Running phase: setup-repo
-[INFO] Running phase: install
-[INFO] Running phase: configure
-[DEBUG] Configuration already matches desired state, skipping restart
-[INFO] Running phase: verify
-[INFO] Nomad bootstrap complete
-```
-
-### Testing with Docker
-
-```bash
-# Build image with bootstrapper
-docker build -t nomad-test:debian-bookworm - <<'EOF'
-FROM debian:bookworm
-RUN apt-get update && apt-get install -y ca-certificates curl
-COPY ./target/release/nomad-bootstrapper /usr/local/bin/
-EOF
-
-# Test bootstrap in container
-docker run --rm -it --privileged nomad-test:debian-bookworm \
-  nomad-bootstrapper --nomad-version 1.6.0 --role server --bootstrap-expect 1 --dry-run
-```
-
-## Supported Systems
-
-- **Debian**: 11 (Bullseye), 12 (Bookworm)
-- **Ubuntu**: 20.04 (Focal), 22.04 (Jammy), 24.04 (Noble)
-- **Rocky Linux**: 8, 9
-
-## Building from Source
-
-```bash
-# Build debug binary
-cargo build
-
-# Build release binary (optimized)
-cargo build --release
-
-# Binary location
-./target/release/nomad-bootstrapper
-```
-
-## Testing
-
-```bash
-# Run all tests
-cargo test --all
-
-# Run unit tests only
-cargo test --lib
-
-# Run with output
-cargo test --lib -- --nocapture
-
-# Integration tests
-cargo test --all --features integration
-
-# Code coverage
-cargo tarpaulin --fail-under 70
-```
-
-## Code Quality
-
-This project maintains strict code quality standards enforced via pre-commit hooks:
-
-```bash
-# Format code
-cargo fmt
-
-# Lint code
-cargo clippy --all-targets --all-features -- -D warnings
-
-# Security audit
-cargo audit
-
-# Check coverage
-cargo tarpaulin --fail-under 70
-```
-
-## Development
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for:
-- Development setup
-- Testing guidelines
-- Code standards
-- Pull request process
-- Conventional commits
-
-## Documentation
-
-- [SETUP.md](SETUP.md) - Development environment setup
-- [CONTRIBUTING.md](CONTRIBUTING.md) - Contribution guidelines
-- [Implementation Plan](../thoughts/shared/plans/2026-04-16-nomad-rust-bootstrapper.md) - Architecture and phases
-- [Design Documents](../thoughts/shared/designs/) - Technical decisions
-
-## License
-
-MIT License - See LICENSE file for details
-
-## Contributing
-
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
----
-
-**Built with ❤️ for reliable infrastructure automation**
+The code splits SSH transport from Debian-specific host behavior so additional backends can be added later without rewriting the controller.
