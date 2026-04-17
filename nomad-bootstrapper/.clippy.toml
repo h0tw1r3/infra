@@ -1,0 +1,7 @@
+# Clippy configuration for strict code quality
+# Most warnings are enforced as errors via CLI (-D warnings flag)
+# This file is for project-specific exceptions and tuning
+
+too-many-arguments-threshold = 8
+type-complexity-threshold = 500
+single-char-binding-names-threshold = 4

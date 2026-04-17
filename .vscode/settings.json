@@ -1,0 +1,13 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "cargo build": true,
+        "cargo test": true,
+        "cargo clippy": true,
+        "cargo fmt": true,
+        "command": true,
+        "true": true,
+        "./scripts/run_debian_integration.sh": true,
+        "docker run": true,
+        "cargo check": true
+    }
+}

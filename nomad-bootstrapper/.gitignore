@@ -1,0 +1,29 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+
+# Test coverage
+/coverage/
+*.profraw
+*.profdata
+tarpaulin-report.html
+cobertura.xml
+
+# Build artifacts
+/dist/
+/build/
+
+# Environment
+.env
+.env.local

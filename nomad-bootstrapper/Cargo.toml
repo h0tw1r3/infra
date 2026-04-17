@@ -1,0 +1,40 @@
+[package]
+name = "nomad-bootstrapper"
+version = "0.1.0"
+edition = "2021"
+authors = ["Clark Contributors"]
+description = "Idempotent state provisioner for HashiCorp Nomad on Debian-based systems"
+license = "MIT"
+repository = "https://github.com/user/clark"
+readme = "README.md"
+
+[[bin]]
+name = "nomad-bootstrapper"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+thiserror = "1.0"
+libc = "0.2"
+chrono = { version = "0.4", features = ["serde"] }
+tempfile = "3.8"
+
+[dev-dependencies]
+mockall = "0.12"
+
+[features]
+default = []
+integration = []
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+
+[profile.dev]
+opt-level = 1
