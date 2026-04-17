@@ -77,12 +77,6 @@ impl NodeConfig {
         })
     }
 
-    pub fn raft_multiplier(&self) -> u8 {
-        match self.latency_profile {
-            LatencyProfile::Standard => 1,
-            LatencyProfile::HighLatency => 5,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

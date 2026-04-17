@@ -60,8 +60,6 @@ fn render_config(config: &NodeConfig) -> Result<String> {
         "  rpc  = \"{{ GetInterfaceIP \\\"default\\\" }}\"".to_string(),
         "  serf = \"{{ GetInterfaceIP \\\"default\\\" }}\"".to_string(),
         "}".to_string(),
-        String::new(),
-        format!("raft_multiplier = {}", config.raft_multiplier()),
     ];
 
     match config.role {
@@ -153,6 +151,5 @@ mod tests {
         assert!(rendered.contains("datacenter = \"homelab\""));
         assert!(rendered.contains("bootstrap_expect = 3"));
         assert!(rendered.contains("retry_join"));
-        assert!(rendered.contains("raft_multiplier = 5"));
     }
 }

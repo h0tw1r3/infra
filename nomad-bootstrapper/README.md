@@ -31,7 +31,7 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
-For the containerized smoke test:
+For the containerized smoke test, which builds the Linux binary in an isolated target directory, runs a full multi-host converge over SSH, and verifies the Nomad cluster comes up healthy:
 
 ```bash
 ./scripts/run_debian_integration.sh
