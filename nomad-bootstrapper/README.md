@@ -47,6 +47,9 @@ datacenter = "homelab"
 nomad_version = "latest"
 high_latency = true
 
+[controller]
+concurrency = 3
+
 [ssh]
 user = "root"
 identity_file = "~/.ssh/id_ed25519"
@@ -74,6 +77,7 @@ user = "admin"
 - `[[nodes]]` must contain at least one host
 - `role = "server"` requires `bootstrap_expect`
 - `role = "client"` requires at least one `server_address`
+- `[controller].concurrency` is optional, defaults to `3`, must be greater than `0`, and is capped by the number of managed hosts
 - SSH settings resolve as:
   1. your existing SSH agent/config when no override is provided
   2. global `[ssh]` defaults
@@ -94,6 +98,11 @@ user = "admin"
 ./target/release/nomad-bootstrapper \
   --inventory ./inventory.toml \
   --dry-run
+
+# Override inventory concurrency at runtime
+./target/release/nomad-bootstrapper \
+  --inventory ./inventory.toml \
+  --concurrency 2
 ```
 
 ### CLI Options
@@ -114,6 +123,9 @@ OPTIONS:
 
     --dry-run
         Show what would be executed without changing remote hosts
+
+    --concurrency <COUNT>
+        Override the inventory controller concurrency with a positive value
 
     --log-level <LEVEL>
         debug, info, warn, error

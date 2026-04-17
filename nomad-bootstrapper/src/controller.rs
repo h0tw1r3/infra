@@ -1,7 +1,7 @@
 use anyhow::Result;
 use log::info;
 
-use crate::config::{Args, Inventory};
+use crate::config::{Args, ExecutionConfig, Inventory};
 use crate::debian::DebianHost;
 use crate::executor::{DependencyGraph, PhaseExecutor};
 use crate::models::{ExecutionContext, ResolvedNode};
@@ -11,22 +11,25 @@ use crate::transport::{RemoteHost, SshTransport, Transport};
 pub fn run(args: &Args) -> Result<()> {
     let inventory = Inventory::load(&args.inventory)?;
     let nodes = inventory.resolve_nodes()?;
+    let execution = inventory.resolve_execution(args, nodes.len())?;
     let executor = DependencyGraph::new();
     let phases = executor.filter_phases(&args.phase, &args.up_to)?;
     let transport = SshTransport::new(args.dry_run);
 
-    run_nodes(&nodes, &phases, &transport)
+    run_nodes(&nodes, &phases, &transport, execution)
 }
 
 fn run_nodes(
     nodes: &[ResolvedNode],
     phases: &[&dyn PhaseExecutor],
     transport: &dyn Transport,
+    execution: ExecutionConfig,
 ) -> Result<()> {
     info!(
-        "Starting Nomad controller run for {} host(s) with {} phase(s)",
+        "Starting Nomad controller run for {} host(s) with {} phase(s) and concurrency limit {}",
         nodes.len(),
-        phases.len()
+        phases.len(),
+        execution.concurrency
     );
 
     for node in nodes {
@@ -174,7 +177,13 @@ mod tests {
         ];
         let phases: Vec<&dyn PhaseExecutor> = Vec::new();
 
-        let err = run_nodes(&nodes, &phases, &transport).expect_err("expected first host failure");
+        let err = run_nodes(
+            &nodes,
+            &phases,
+            &transport,
+            ExecutionConfig { concurrency: 1 },
+        )
+        .expect_err("expected first host failure");
         assert!(err.to_string().contains("not supported"));
 
         let calls = calls.lock().expect("calls lock");

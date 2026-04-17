@@ -30,6 +30,7 @@ mod tests {
         assert!(stdout.contains("Bootstrap Nomad on Debian hosts over SSH"));
         assert!(stdout.contains("--inventory"));
         assert!(stdout.contains("--phase"));
+        assert!(stdout.contains("--concurrency"));
     }
 
     #[test]
@@ -98,6 +99,9 @@ mod tests {
     fn test_dry_run_with_valid_inventory_succeeds() {
         let (_dir, inventory) = write_inventory(
             r#"
+            [controller]
+            concurrency = 4
+
             [[nodes]]
             name = "server-1"
             host = "server-1.example.com"
@@ -112,9 +116,38 @@ mod tests {
                 "--inventory",
                 inventory.to_str().expect("inventory path"),
                 "--dry-run",
+                "--concurrency",
+                "1",
             ])
             .output()
             .expect("run dry-run");
         assert!(output.status.success(), "{:?}", output);
+    }
+
+    #[test]
+    fn test_zero_concurrency_is_rejected() {
+        let (_dir, inventory) = write_inventory(
+            r#"
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            role = "server"
+            bootstrap_expect = 1
+        "#,
+        );
+
+        let output = Command::new(bin_path())
+            .args([
+                "--inventory",
+                inventory.to_str().expect("inventory path"),
+                "--concurrency",
+                "0",
+            ])
+            .output()
+            .expect("run invalid concurrency");
+        assert!(!output.status.success());
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("invalid value"));
     }
 }

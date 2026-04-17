@@ -1,5 +1,6 @@
 use std::fs;
 use std::net::IpAddr;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -37,6 +38,10 @@ pub struct Args {
     /// Log level (debug, info, warn, error).
     #[arg(long, default_value = "info")]
     pub log_level: String,
+
+    /// Override the inventory host concurrency limit with a positive value.
+    #[arg(long)]
+    pub concurrency: Option<NonZeroUsize>,
 }
 
 impl Args {
@@ -74,6 +79,12 @@ impl Default for ClusterConfig {
 pub struct DefaultsConfig {
     pub nomad_version: Option<String>,
     pub high_latency: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ControllerConfig {
+    pub concurrency: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default, PartialEq, Eq)]
@@ -139,9 +150,18 @@ pub struct Inventory {
     #[serde(default)]
     pub defaults: DefaultsConfig,
     #[serde(default)]
+    pub controller: ControllerConfig,
+    #[serde(default)]
     pub ssh: SshConfig,
     pub nodes: Vec<NodeInventory>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutionConfig {
+    pub concurrency: usize,
+}
+
+const DEFAULT_CONCURRENCY: usize = 3;
 
 impl Inventory {
     pub fn load(path: &Path) -> Result<Self> {
@@ -158,6 +178,26 @@ impl Inventory {
             .iter()
             .map(|node| self.resolve_node(node))
             .collect::<Result<Vec<_>>>()
+    }
+
+    pub fn resolve_execution(&self, args: &Args, host_count: usize) -> Result<ExecutionConfig> {
+        if host_count == 0 {
+            anyhow::bail!("execution requires at least one host");
+        }
+
+        if matches!(self.controller.concurrency, Some(0)) {
+            anyhow::bail!("controller concurrency must be greater than 0");
+        }
+
+        let requested = args
+            .concurrency
+            .map(NonZeroUsize::get)
+            .or(self.controller.concurrency)
+            .unwrap_or(DEFAULT_CONCURRENCY);
+
+        Ok(ExecutionConfig {
+            concurrency: requested.min(host_count),
+        })
     }
 
     fn resolve_node(&self, node: &NodeInventory) -> Result<ResolvedNode> {
@@ -344,6 +384,18 @@ fn validate_address(val: &str) -> std::result::Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
+
+    fn args_with_concurrency(concurrency: Option<usize>) -> Args {
+        Args {
+            inventory: PathBuf::from("inventory.toml"),
+            phase: None,
+            up_to: None,
+            dry_run: false,
+            log_level: "info".to_string(),
+            concurrency: concurrency.and_then(NonZeroUsize::new),
+        }
+    }
 
     const INVENTORY: &str = r#"
         [cluster]
@@ -352,6 +404,9 @@ mod tests {
         [defaults]
         nomad_version = "1.7.6"
         high_latency = true
+
+        [controller]
+        concurrency = 8
 
         [ssh]
         user = "admin"
@@ -408,6 +463,50 @@ mod tests {
 
         let client = &nodes[1].config;
         assert_eq!(client.latency_profile, LatencyProfile::Standard);
+    }
+
+    #[test]
+    fn test_inventory_resolves_execution_from_controller_defaults() {
+        let inventory: Inventory = toml::from_str(INVENTORY).expect("inventory parses");
+
+        let execution = inventory
+            .resolve_execution(&args_with_concurrency(None), 2)
+            .expect("execution resolves");
+
+        assert_eq!(execution.concurrency, 2);
+    }
+
+    #[test]
+    fn test_cli_concurrency_override_takes_precedence() {
+        let inventory: Inventory = toml::from_str(INVENTORY).expect("inventory parses");
+
+        let execution = inventory
+            .resolve_execution(&args_with_concurrency(Some(1)), 2)
+            .expect("execution resolves");
+
+        assert_eq!(execution.concurrency, 1);
+    }
+
+    #[test]
+    fn test_inventory_rejects_zero_controller_concurrency() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [controller]
+            concurrency = 0
+
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            role = "server"
+            bootstrap_expect = 1
+        "#,
+        )
+        .expect("inventory parses");
+
+        let err = inventory
+            .resolve_execution(&args_with_concurrency(None), 1)
+            .expect_err("expected validation error");
+        assert!(err.to_string().contains("greater than 0"));
     }
 
     #[test]
