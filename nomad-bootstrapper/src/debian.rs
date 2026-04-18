@@ -116,6 +116,27 @@ impl<'a> DebianHost<'a> {
         Ok(installed.split('-').next().unwrap_or(&installed) == desired)
     }
 
+    pub fn latest_nomad_needs_install(&self) -> Result<bool> {
+        if self.remote.is_dry_run() {
+            return Ok(true);
+        }
+
+        if self.installed_nomad_version()?.is_none() {
+            return Ok(true);
+        }
+
+        let output = self.remote.run("apt list --upgradable nomad 2>&1")?;
+        if !output.success() {
+            anyhow::bail!(
+                "host {} could not determine whether nomad is upgradable: {}",
+                self.remote.label(),
+                output.stderr.trim()
+            );
+        }
+
+        Ok(output.stdout.contains("upgradable from"))
+    }
+
     pub fn write_repo_file(&self, content: &str) -> Result<()> {
         self.remote
             .write_file_atomic_privileged(HASHICORP_SOURCE_LIST_PATH, content, 0o644)
