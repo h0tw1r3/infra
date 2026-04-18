@@ -215,8 +215,8 @@ mod tests {
 
     use super::*;
     use crate::models::{
-        ExecutionContext, LatencyProfile, NodeConfig, NodeRole, PhaseResult, ResolvedTarget,
-        ServerConfig,
+        AdvertiseConfig, ExecutionContext, LatencyProfile, NodeConfig, NodeRole, PhaseResult,
+        ResolvedTarget, ServerConfig,
     };
     use crate::transport::{RemoteOutput, Transport};
 
@@ -242,6 +242,8 @@ mod tests {
                         server_join_addresses: Vec::new(),
                     }),
                     client_config: None,
+                    bind_addr: None,
+                    advertise: AdvertiseConfig::default(),
                     latency_profile: LatencyProfile::Standard,
                 },
             },
@@ -265,6 +267,8 @@ mod tests {
                         server_join_addresses: Vec::new(),
                     }),
                     client_config: None,
+                    bind_addr: None,
+                    advertise: AdvertiseConfig::default(),
                     latency_profile: LatencyProfile::Standard,
                 },
             },

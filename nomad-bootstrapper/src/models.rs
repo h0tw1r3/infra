@@ -47,6 +47,14 @@ pub struct ClientConfig {
     pub server_addresses: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdvertiseConfig {
+    pub address: Option<String>,
+    pub http: Option<String>,
+    pub rpc: Option<String>,
+    pub serf: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeConfig {
     pub name: String,
@@ -55,6 +63,8 @@ pub struct NodeConfig {
     pub role: NodeRole,
     pub server_config: Option<ServerConfig>,
     pub client_config: Option<ClientConfig>,
+    pub bind_addr: Option<String>,
+    pub advertise: AdvertiseConfig,
     pub latency_profile: LatencyProfile,
 }
 
@@ -76,7 +86,6 @@ impl NodeConfig {
             )
         })
     }
-
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,5 +175,14 @@ mod tests {
         let unchanged = PhaseResult::unchanged("verify", "already healthy");
         assert!(!unchanged.changes_made);
         assert_eq!(unchanged.message, "already healthy");
+    }
+
+    #[test]
+    fn test_advertise_config_defaults_to_no_overrides() {
+        let advertise = AdvertiseConfig::default();
+        assert_eq!(advertise.address, None);
+        assert_eq!(advertise.http, None);
+        assert_eq!(advertise.rpc, None);
+        assert_eq!(advertise.serf, None);
     }
 }

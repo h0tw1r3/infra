@@ -64,12 +64,20 @@ host = "server-1.example.com"
 role = "server"
 bootstrap_expect = 3
 server_join_address = ["10.0.1.2:4648", "10.0.1.3:4648"]
+bind_addr = "10.0.1.10"
+advertise = "10.0.1.20"
 
 [[nodes]]
 name = "client-1"
 host = "client-1.example.com"
 role = "client"
 server_address = ["10.0.1.1:4647", "10.0.1.2:4647"]
+bind_addr = "0.0.0.0"
+
+[nodes.advertise]
+http = "10.0.2.20"
+rpc = "10.0.2.21"
+serf = "10.0.2.22:4648"
 
 [nodes.ssh]
 user = "root"
@@ -81,12 +89,22 @@ privilege_escalation = []
 - `[[nodes]]` must contain at least one host
 - `role = "server"` requires `bootstrap_expect`
 - `role = "client"` requires at least one `server_address`
+- `bind_addr` is optional per node and is written directly into the generated Nomad agent config as a non-empty passthrough string
+- `advertise` is optional per node and supports either a scalar `advertise = "..."` value or a `[nodes.advertise]` table with `http`, `rpc`, and/or `serf`
+- `bind_addr` and `advertise` values are treated uniformly as non-empty passthrough strings; they may be literal addresses, hostnames, or Nomad/go-sockaddr template expressions, and the bootstrapper does not resolve or semantically validate them
+- The generated config always includes an `advertise` block; each effective advertise value resolves in order from the per-protocol override, to the shared `advertise` value, to an explicit non-`0.0.0.0` `bind_addr`, and finally to Nomad's default-interface IP template
+- The scalar and table forms are mutually exclusive in TOML, but a shared scalar advertise value can still combine with per-protocol fallbacks in the resolved config
 - `[controller].concurrency` is optional, defaults to `3`, must be greater than `0`, and is capped by the number of managed hosts
 - SSH settings resolve as:
   1. your existing SSH agent/config when no override is provided
   2. global `[ssh]` defaults
   3. per-node `[nodes.ssh]` overrides
 - `privilege_escalation` is an optional argv-style command list used only for non-root SSH users. Per-node overrides replace the global value, `[]` disables an inherited value, and remote root sessions bypass escalation.
+
+### Network Value Notes
+
+- Falling back from `advertise` to `bind_addr` is a convenience heuristic, not a general networking recommendation.
+- Multi-homed, NAT, or split-network deployments should set explicit advertise values instead of relying on `bind_addr` fallback.
 
 ## Usage
 

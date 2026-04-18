@@ -10,7 +10,8 @@ use serde::Deserialize;
 
 use crate::executor::PHASE_NAMES;
 use crate::models::{
-    ClientConfig, LatencyProfile, NodeConfig, NodeRole, ResolvedNode, ResolvedTarget, ServerConfig,
+    AdvertiseConfig, ClientConfig, LatencyProfile, NodeConfig, NodeRole, ResolvedNode,
+    ResolvedTarget, ServerConfig,
 };
 
 #[derive(Parser, Debug)]
@@ -142,6 +143,21 @@ struct ResolvedTargetSsh {
     privilege_escalation: Option<Vec<String>>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdvertiseInventoryConfig {
+    pub http: Option<String>,
+    pub rpc: Option<String>,
+    pub serf: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum AdvertiseInventory {
+    Address(String),
+    Addresses(AdvertiseInventoryConfig),
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeInventory {
@@ -156,6 +172,9 @@ pub struct NodeInventory {
     pub nomad_version: Option<String>,
     pub high_latency: Option<bool>,
     pub datacenter: Option<String>,
+    pub bind_addr: Option<String>,
+    #[serde(default)]
+    pub advertise: Option<AdvertiseInventory>,
     #[serde(default)]
     pub ssh: Option<SshConfig>,
 }
@@ -261,6 +280,8 @@ impl Inventory {
             .map(|value| validate_address(value))
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|err| anyhow::anyhow!("node '{}': {}", name, err))?;
+        let bind_addr = normalize_nomad_config_value(node.bind_addr.as_deref(), name, "bind_addr")?;
+        let advertise = resolve_advertise(node.advertise.as_ref(), name)?;
 
         let config = match node.role {
             NodeRole::Server => {
@@ -281,6 +302,8 @@ impl Inventory {
                         server_join_addresses,
                     }),
                     client_config: None,
+                    bind_addr,
+                    advertise,
                     latency_profile,
                 }
             }
@@ -296,6 +319,8 @@ impl Inventory {
                     role: NodeRole::Client,
                     server_config: None,
                     client_config: Some(ClientConfig { server_addresses }),
+                    bind_addr,
+                    advertise,
                     latency_profile,
                 }
             }
@@ -347,6 +372,64 @@ fn validate_privilege_escalation(
                 .collect::<Result<Vec<_>>>()
         })
         .transpose()
+}
+
+fn normalize_nomad_config_value(
+    value: Option<&str>,
+    node_name: &str,
+    field_name: &str,
+) -> Result<Option<String>> {
+    value
+        .map(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("node '{}' {} cannot be empty", node_name, field_name);
+            }
+            Ok(trimmed.to_string())
+        })
+        .transpose()
+}
+
+fn resolve_advertise(
+    advertise: Option<&AdvertiseInventory>,
+    node_name: &str,
+) -> Result<AdvertiseConfig> {
+    match advertise {
+        None => Ok(AdvertiseConfig::default()),
+        Some(AdvertiseInventory::Address(value)) => Ok(AdvertiseConfig {
+            address: normalize_nomad_config_value(Some(value.as_str()), node_name, "advertise")?,
+            ..AdvertiseConfig::default()
+        }),
+        Some(AdvertiseInventory::Addresses(config)) => {
+            let advertise = AdvertiseConfig {
+                address: None,
+                http: normalize_nomad_config_value(
+                    config.http.as_deref(),
+                    node_name,
+                    "advertise.http",
+                )?,
+                rpc: normalize_nomad_config_value(
+                    config.rpc.as_deref(),
+                    node_name,
+                    "advertise.rpc",
+                )?,
+                serf: normalize_nomad_config_value(
+                    config.serf.as_deref(),
+                    node_name,
+                    "advertise.serf",
+                )?,
+            };
+
+            if advertise.http.is_none() && advertise.rpc.is_none() && advertise.serf.is_none() {
+                anyhow::bail!(
+                    "node '{}' advertise must set at least one of http, rpc, or serf",
+                    node_name
+                );
+            }
+
+            Ok(advertise)
+        }
+    }
 }
 
 fn validate_address(val: &str) -> std::result::Result<String, String> {
@@ -473,6 +556,8 @@ mod tests {
         role = "server"
         bootstrap_expect = 3
         server_join_address = ["10.0.1.2:4648", "10.0.1.3:4648"]
+        bind_addr = "10.0.1.10"
+        advertise = "10.0.1.20"
 
         [nodes.ssh]
         user = "root"
@@ -485,6 +570,11 @@ mod tests {
         role = "client"
         server_address = ["10.0.1.1:4647"]
         high_latency = false
+
+        [nodes.advertise]
+        http = "10.0.2.20"
+        rpc = "10.0.2.21"
+        serf = "10.0.2.22:4648"
     "#;
 
     #[test]
@@ -524,9 +614,15 @@ mod tests {
         let server = &nodes[0].config;
         assert_eq!(server.datacenter, "homelab");
         assert_eq!(server.version, "1.7.6");
+        assert_eq!(server.bind_addr.as_deref(), Some("10.0.1.10"));
+        assert_eq!(server.advertise.address.as_deref(), Some("10.0.1.20"));
         assert_eq!(server.latency_profile, LatencyProfile::HighLatency);
 
         let client = &nodes[1].config;
+        assert_eq!(client.bind_addr, None);
+        assert_eq!(client.advertise.http.as_deref(), Some("10.0.2.20"));
+        assert_eq!(client.advertise.rpc.as_deref(), Some("10.0.2.21"));
+        assert_eq!(client.advertise.serf.as_deref(), Some("10.0.2.22:4648"));
         assert_eq!(client.latency_profile, LatencyProfile::Standard);
     }
 
@@ -656,5 +752,48 @@ mod tests {
     fn test_validate_address_rejects_invalid_hostname() {
         let err = validate_address("bad host").expect_err("expected invalid hostname");
         assert!(err.contains("invalid characters"));
+    }
+
+    #[test]
+    fn test_inventory_rejects_empty_bind_addr() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            role = "server"
+            bootstrap_expect = 1
+            bind_addr = "   "
+        "#,
+        )
+        .expect("inventory parses");
+
+        let err = inventory
+            .resolve_nodes()
+            .expect_err("expected validation error");
+        assert!(err.to_string().contains("bind_addr cannot be empty"));
+    }
+
+    #[test]
+    fn test_inventory_rejects_empty_advertise_block() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            role = "server"
+            bootstrap_expect = 1
+
+            [nodes.advertise]
+        "#,
+        )
+        .expect("inventory parses");
+
+        let err = inventory
+            .resolve_nodes()
+            .expect_err("expected validation error");
+        assert!(err
+            .to_string()
+            .contains("advertise must set at least one of http, rpc, or serf"));
     }
 }
