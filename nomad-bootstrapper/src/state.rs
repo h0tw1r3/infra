@@ -21,7 +21,7 @@ impl ProvisionedState {
             return Self::default();
         }
 
-        let raw = match host.read_file(PROVISIONED_STATE_PATH) {
+        let raw = match host.read_file_privileged(PROVISIONED_STATE_PATH) {
             Ok(raw) => raw,
             Err(err) => {
                 warn!(
