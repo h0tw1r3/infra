@@ -7,7 +7,7 @@ Instead of installing the tool on every node, you run it once from your control 
 ## Features
 
 - **Remote-first**: runs from your laptop, CI runner, or admin box over SSH
-- **Declarative inventory**: cluster topology, Nomad role, and SSH settings live in TOML
+- **Declarative inventory**: cluster topology, Nomad roles, and SSH settings live in TOML
 - **Strict fleet preflight**: connectivity, Debian compatibility, and provisioning capability are validated before any mutating phase starts
 - **Configurable privilege path**: non-root SSH users can run privileged operations through a configured escalation command such as `sudo -n` or `doas`
 - **Hybrid idempotency**: live remote probes are authoritative; an optional node-local state file is advisory only
@@ -61,7 +61,7 @@ privilege_escalation = ["sudo", "-n"]
 [[nodes]]
 name = "server-1"
 host = "server-1.example.com"
-role = "server"
+roles = ["server"]
 bootstrap_expect = 3
 server_join_address = ["10.0.1.2:4648", "10.0.1.3:4648"]
 bind_addr = "10.0.1.10"
@@ -70,7 +70,7 @@ advertise = "10.0.1.20"
 [[nodes]]
 name = "client-1"
 host = "client-1.example.com"
-role = "client"
+roles = ["client"]
 server_address = ["10.0.1.1:4647", "10.0.1.2:4647"]
 bind_addr = "0.0.0.0"
 
@@ -87,8 +87,9 @@ privilege_escalation = []
 ### Inventory Rules
 
 - `[[nodes]]` must contain at least one host
-- `role = "server"` requires `bootstrap_expect`
-- `role = "client"` requires at least one `server_address`
+- `roles` is a required array containing `server`, `client`, or both
+- any node whose `roles` includes `server` requires `bootstrap_expect`
+- any node whose `roles` includes `client` requires at least one `server_address`
 - `bind_addr` is optional per node and is written directly into the generated Nomad agent config as a non-empty passthrough string
 - `advertise` is optional per node and supports either a scalar `advertise = "..."` value or a `[nodes.advertise]` table with `http`, `rpc`, and/or `serf`
 - `bind_addr` and `advertise` values are treated uniformly as non-empty passthrough strings; they may be literal addresses, hostnames, or Nomad/go-sockaddr template expressions, and the bootstrapper does not resolve or semantically validate them
@@ -127,10 +128,6 @@ privilege_escalation = []
   --inventory ./inventory.toml \
   --dry-run
 
-# Override inventory concurrency at runtime
-./target/release/nomad-bootstrapper \
-  --inventory ./inventory.toml \
-  --concurrency 2
 ```
 
 ### CLI Options
@@ -154,9 +151,6 @@ OPTIONS:
 
     --dry-run
         Show what would be executed without changing remote hosts
-
-    --concurrency <COUNT>
-        Override the inventory controller concurrency with a positive value
 
     --log-level <LEVEL>
         debug, info, warn, error

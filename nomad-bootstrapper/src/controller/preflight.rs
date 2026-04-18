@@ -198,7 +198,7 @@ mod tests {
                     name: (*name).to_string(),
                     datacenter: "dc1".to_string(),
                     version: "latest".to_string(),
-                    role: NodeRole::Server,
+                    roles: vec![NodeRole::Server],
                     server_config: Some(ServerConfig {
                         bootstrap_expect: 1,
                         server_join_addresses: Vec::new(),

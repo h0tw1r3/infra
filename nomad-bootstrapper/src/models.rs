@@ -55,12 +55,22 @@ pub struct AdvertiseConfig {
     pub serf: Option<String>,
 }
 
+/// Resolved per-node Nomad intent from the inventory.
+///
+/// Invariant: `roles` is the authoritative list of intended capabilities, and
+/// the role-specific config payloads must stay aligned with it:
+/// - `server_config` must be `Some` iff `roles` contains `NodeRole::Server`
+/// - `client_config` must be `Some` iff `roles` contains `NodeRole::Client`
+///
+/// `Inventory::resolve_node` is the canonical constructor, and renderer/test
+/// fixtures should preserve this invariant because configuration rendering
+/// branches on `roles` and then reads the matching role-specific payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeConfig {
     pub name: String,
     pub datacenter: String,
     pub version: String,
-    pub role: NodeRole,
+    pub roles: Vec<NodeRole>,
     pub server_config: Option<ServerConfig>,
     pub client_config: Option<ClientConfig>,
     pub bind_addr: Option<String>,
@@ -69,11 +79,23 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    pub fn has_role(&self, role: NodeRole) -> bool {
+        self.roles.contains(&role)
+    }
+
+    fn roles_label(&self) -> String {
+        self.roles
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     pub fn server_config(&self) -> Result<&ServerConfig> {
         self.server_config.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "server configuration is not available for role {}",
-                self.role
+                "server configuration is not available for roles {}",
+                self.roles_label()
             )
         })
     }
@@ -81,8 +103,8 @@ impl NodeConfig {
     pub fn client_config(&self) -> Result<&ClientConfig> {
         self.client_config.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "client configuration is not available for role {}",
-                self.role
+                "client configuration is not available for roles {}",
+                self.roles_label()
             )
         })
     }
@@ -160,6 +182,25 @@ impl PhaseResult {
 mod tests {
     use super::*;
 
+    fn dual_role_node_config() -> NodeConfig {
+        NodeConfig {
+            name: "node-1".to_string(),
+            datacenter: "dc1".to_string(),
+            version: "latest".to_string(),
+            roles: vec![NodeRole::Server, NodeRole::Client],
+            server_config: Some(ServerConfig {
+                bootstrap_expect: 1,
+                server_join_addresses: vec!["10.0.1.2:4648".to_string()],
+            }),
+            client_config: Some(ClientConfig {
+                server_addresses: vec!["10.0.1.1:4647".to_string()],
+            }),
+            bind_addr: None,
+            advertise: AdvertiseConfig::default(),
+            latency_profile: LatencyProfile::Standard,
+        }
+    }
+
     #[test]
     fn test_node_role_display() {
         assert_eq!(NodeRole::Server.to_string(), "server");
@@ -184,5 +225,42 @@ mod tests {
         assert_eq!(advertise.http, None);
         assert_eq!(advertise.rpc, None);
         assert_eq!(advertise.serf, None);
+    }
+
+    #[test]
+    fn test_dual_role_node_config_exposes_both_role_payloads() {
+        let config = dual_role_node_config();
+        assert!(config.has_role(NodeRole::Server));
+        assert!(config.has_role(NodeRole::Client));
+        assert_eq!(
+            config
+                .server_config()
+                .expect("server config")
+                .bootstrap_expect,
+            1
+        );
+        assert_eq!(
+            config
+                .client_config()
+                .expect("client config")
+                .server_addresses,
+            vec!["10.0.1.1:4647".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_server_config_error_mentions_active_roles() {
+        let config = NodeConfig {
+            roles: vec![NodeRole::Server, NodeRole::Client],
+            server_config: None,
+            ..dual_role_node_config()
+        };
+
+        let err = config
+            .server_config()
+            .expect_err("expected invariant failure");
+        assert!(err
+            .to_string()
+            .contains("server configuration is not available for roles server, client"));
     }
 }

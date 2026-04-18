@@ -31,7 +31,7 @@ mod tests {
         assert!(stdout.contains("--inventory"));
         assert!(stdout.contains("--phase"));
         assert!(stdout.contains("--preflight-only"));
-        assert!(stdout.contains("--concurrency"));
+        assert!(!stdout.contains("--concurrency"));
     }
 
     #[test]
@@ -53,7 +53,7 @@ mod tests {
             [[nodes]]
             name = "server-1"
             host = "server-1.example.com"
-            role = "server"
+            roles = ["server"]
             bootstrap_expect = 1
         "#,
         );
@@ -82,7 +82,7 @@ mod tests {
             [[nodes]]
             name = "server-1"
             host = "server-1.example.com"
-            role = "server"
+            roles = ["server"]
             bootstrap_expect = 1
         "#,
         );
@@ -110,7 +110,7 @@ mod tests {
             [[nodes]]
             name = "server-1"
             host = "server-1.example.com"
-            role = "server"
+            roles = ["server"]
         "#,
         );
 
@@ -134,7 +134,7 @@ mod tests {
             [[nodes]]
             name = "server-1"
             host = "server-1.example.com"
-            role = "server"
+            roles = ["server"]
             bootstrap_expect = 1
             nomad_version = "latest"
         "#,
@@ -145,8 +145,6 @@ mod tests {
                 "--inventory",
                 inventory.to_str().expect("inventory path"),
                 "--dry-run",
-                "--concurrency",
-                "1",
             ])
             .output()
             .expect("run dry-run");
@@ -160,7 +158,7 @@ mod tests {
             [[nodes]]
             name = "server-1"
             host = "server-1.example.com"
-            role = "server"
+            roles = ["server"]
             bootstrap_expect = 1
             nomad_version = "latest"
         "#,
@@ -191,7 +189,7 @@ mod tests {
             [[nodes]]
             name = "server-1"
             host = "server-1.example.com"
-            role = "server"
+            roles = ["server"]
             bootstrap_expect = 1
         "#,
         );
@@ -217,14 +215,40 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_concurrency_is_rejected() {
+    fn test_zero_controller_concurrency_is_rejected() {
         let (_dir, inventory) = write_inventory(
             r#"
+            [controller]
+            concurrency = 0
+
             [[nodes]]
             name = "server-1"
             host = "server-1.example.com"
-            role = "server"
+            roles = ["server"]
             bootstrap_expect = 1
+        "#,
+        );
+
+        let output = Command::new(bin_path())
+            .args(["--inventory", inventory.to_str().expect("inventory path")])
+            .output()
+            .expect("run invalid concurrency");
+        assert!(!output.status.success());
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("greater than 0"));
+    }
+
+    #[test]
+    fn test_dry_run_with_dual_role_inventory_succeeds() {
+        let (_dir, inventory) = write_inventory(
+            r#"
+            [[nodes]]
+            name = "node-1"
+            host = "node-1.example.com"
+            roles = ["server", "client"]
+            bootstrap_expect = 1
+            server_address = ["10.0.1.1:4647"]
         "#,
         );
 
@@ -232,14 +256,10 @@ mod tests {
             .args([
                 "--inventory",
                 inventory.to_str().expect("inventory path"),
-                "--concurrency",
-                "0",
+                "--dry-run",
             ])
             .output()
-            .expect("run invalid concurrency");
-        assert!(!output.status.success());
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("invalid value"));
+            .expect("run dual-role dry-run");
+        assert!(output.status.success(), "{:?}", output);
     }
 }

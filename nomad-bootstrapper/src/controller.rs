@@ -36,7 +36,7 @@ enum RunAbortReason {
 pub fn run(args: &Args) -> Result<()> {
     let inventory = Inventory::load(&args.inventory)?;
     let nodes = inventory.resolve_nodes()?;
-    let execution = inventory.resolve_execution(args, nodes.len())?;
+    let execution = inventory.resolve_execution(nodes.len())?;
     let executor = DependencyGraph::new();
     let phases = executor.filter_phases(&args.phase, &args.up_to)?;
     let transport = SshTransport::new(args.dry_run)?;
@@ -236,7 +236,7 @@ mod tests {
                     name: "node-1".to_string(),
                     datacenter: "dc1".to_string(),
                     version: "latest".to_string(),
-                    role: NodeRole::Server,
+                    roles: vec![NodeRole::Server],
                     server_config: Some(ServerConfig {
                         bootstrap_expect: 1,
                         server_join_addresses: Vec::new(),
@@ -261,7 +261,7 @@ mod tests {
                     name: "node-2".to_string(),
                     datacenter: "dc1".to_string(),
                     version: "latest".to_string(),
-                    role: NodeRole::Server,
+                    roles: vec![NodeRole::Server],
                     server_config: Some(ServerConfig {
                         bootstrap_expect: 1,
                         server_join_addresses: Vec::new(),

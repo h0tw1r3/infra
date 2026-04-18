@@ -1,6 +1,5 @@
 use std::fs;
 use std::net::IpAddr;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -43,10 +42,6 @@ pub struct Args {
     /// Log level (debug, info, warn, error).
     #[arg(long, default_value = "info")]
     pub log_level: String,
-
-    /// Override the inventory host concurrency limit with a positive value.
-    #[arg(long)]
-    pub concurrency: Option<NonZeroUsize>,
 }
 
 impl Args {
@@ -163,7 +158,7 @@ pub enum AdvertiseInventory {
 pub struct NodeInventory {
     pub name: String,
     pub host: String,
-    pub role: NodeRole,
+    pub roles: Vec<NodeRole>,
     pub bootstrap_expect: Option<u32>,
     #[serde(default)]
     pub server_join_address: Vec<String>,
@@ -217,7 +212,7 @@ impl Inventory {
             .collect::<Result<Vec<_>>>()
     }
 
-    pub fn resolve_execution(&self, args: &Args, host_count: usize) -> Result<ExecutionConfig> {
+    pub fn resolve_execution(&self, host_count: usize) -> Result<ExecutionConfig> {
         if host_count == 0 {
             anyhow::bail!("execution requires at least one host");
         }
@@ -226,11 +221,7 @@ impl Inventory {
             anyhow::bail!("controller concurrency must be greater than 0");
         }
 
-        let requested = args
-            .concurrency
-            .map(NonZeroUsize::get)
-            .or(self.controller.concurrency)
-            .unwrap_or(DEFAULT_CONCURRENCY);
+        let requested = self.controller.concurrency.unwrap_or(DEFAULT_CONCURRENCY);
 
         Ok(ExecutionConfig {
             concurrency: requested.min(host_count),
@@ -258,6 +249,7 @@ impl Inventory {
             .clone()
             .or_else(|| self.defaults.nomad_version.clone())
             .unwrap_or_else(|| "latest".to_string());
+        let roles = validate_roles(&node.roles, name)?;
         let latency_profile = if node
             .high_latency
             .or(self.defaults.high_latency)
@@ -282,48 +274,40 @@ impl Inventory {
             .map_err(|err| anyhow::anyhow!("node '{}': {}", name, err))?;
         let bind_addr = normalize_nomad_config_value(node.bind_addr.as_deref(), name, "bind_addr")?;
         let advertise = resolve_advertise(node.advertise.as_ref(), name)?;
-
-        let config = match node.role {
-            NodeRole::Server => {
-                let bootstrap_expect = node.bootstrap_expect.ok_or_else(|| {
-                    anyhow::anyhow!("node '{}' requires bootstrap_expect for server role", name)
-                })?;
-                if bootstrap_expect == 0 {
-                    anyhow::bail!("node '{}' bootstrap_expect must be greater than 0", name);
-                }
-
-                NodeConfig {
-                    name: name.to_string(),
-                    datacenter,
-                    version,
-                    role: NodeRole::Server,
-                    server_config: Some(ServerConfig {
-                        bootstrap_expect,
-                        server_join_addresses,
-                    }),
-                    client_config: None,
-                    bind_addr,
-                    advertise,
-                    latency_profile,
-                }
+        let server_config = if roles.contains(&NodeRole::Server) {
+            let bootstrap_expect = node.bootstrap_expect.ok_or_else(|| {
+                anyhow::anyhow!("node '{}' requires bootstrap_expect for server role", name)
+            })?;
+            if bootstrap_expect == 0 {
+                anyhow::bail!("node '{}' bootstrap_expect must be greater than 0", name);
             }
-            NodeRole::Client => {
-                if server_addresses.is_empty() {
-                    anyhow::bail!("node '{}' requires at least one server_address", name);
-                }
+            Some(ServerConfig {
+                bootstrap_expect,
+                server_join_addresses,
+            })
+        } else {
+            None
+        };
 
-                NodeConfig {
-                    name: name.to_string(),
-                    datacenter,
-                    version,
-                    role: NodeRole::Client,
-                    server_config: None,
-                    client_config: Some(ClientConfig { server_addresses }),
-                    bind_addr,
-                    advertise,
-                    latency_profile,
-                }
+        let client_config = if roles.contains(&NodeRole::Client) {
+            if server_addresses.is_empty() {
+                anyhow::bail!("node '{}' requires at least one server_address", name);
             }
+            Some(ClientConfig { server_addresses })
+        } else {
+            None
+        };
+
+        let config = NodeConfig {
+            name: name.to_string(),
+            datacenter,
+            version,
+            roles,
+            server_config,
+            client_config,
+            bind_addr,
+            advertise,
+            latency_profile,
         };
 
         Ok(ResolvedNode {
@@ -372,6 +356,22 @@ fn validate_privilege_escalation(
                 .collect::<Result<Vec<_>>>()
         })
         .transpose()
+}
+
+fn validate_roles(roles: &[NodeRole], node_name: &str) -> Result<Vec<NodeRole>> {
+    if roles.is_empty() {
+        anyhow::bail!("node '{}' must define at least one role", node_name);
+    }
+
+    let mut normalized = Vec::with_capacity(roles.len());
+    for role in roles {
+        if normalized.contains(role) {
+            anyhow::bail!("node '{}' role '{}' is duplicated", node_name, role);
+        }
+        normalized.push(*role);
+    }
+
+    Ok(normalized)
 }
 
 fn normalize_nomad_config_value(
@@ -519,19 +519,6 @@ fn validate_address(val: &str) -> std::result::Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::num::NonZeroUsize;
-
-    fn args_with_concurrency(concurrency: Option<usize>) -> Args {
-        Args {
-            inventory: PathBuf::from("inventory.toml"),
-            phase: None,
-            up_to: None,
-            preflight_only: false,
-            dry_run: false,
-            log_level: "info".to_string(),
-            concurrency: concurrency.and_then(NonZeroUsize::new),
-        }
-    }
 
     const INVENTORY: &str = r#"
         [cluster]
@@ -553,7 +540,7 @@ mod tests {
         [[nodes]]
         name = "server-1"
         host = "server-1.example.com"
-        role = "server"
+        roles = ["server"]
         bootstrap_expect = 3
         server_join_address = ["10.0.1.2:4648", "10.0.1.3:4648"]
         bind_addr = "10.0.1.10"
@@ -567,7 +554,7 @@ mod tests {
         [[nodes]]
         name = "client-1"
         host = "client-1.example.com"
-        role = "client"
+        roles = ["client"]
         server_address = ["10.0.1.1:4647"]
         high_latency = false
 
@@ -612,6 +599,7 @@ mod tests {
         let nodes = inventory.resolve_nodes().expect("nodes resolve");
 
         let server = &nodes[0].config;
+        assert_eq!(server.roles, vec![NodeRole::Server]);
         assert_eq!(server.datacenter, "homelab");
         assert_eq!(server.version, "1.7.6");
         assert_eq!(server.bind_addr.as_deref(), Some("10.0.1.10"));
@@ -619,6 +607,7 @@ mod tests {
         assert_eq!(server.latency_profile, LatencyProfile::HighLatency);
 
         let client = &nodes[1].config;
+        assert_eq!(client.roles, vec![NodeRole::Client]);
         assert_eq!(client.bind_addr, None);
         assert_eq!(client.advertise.http.as_deref(), Some("10.0.2.20"));
         assert_eq!(client.advertise.rpc.as_deref(), Some("10.0.2.21"));
@@ -630,22 +619,26 @@ mod tests {
     fn test_inventory_resolves_execution_from_controller_defaults() {
         let inventory: Inventory = toml::from_str(INVENTORY).expect("inventory parses");
 
-        let execution = inventory
-            .resolve_execution(&args_with_concurrency(None), 2)
-            .expect("execution resolves");
+        let execution = inventory.resolve_execution(2).expect("execution resolves");
 
         assert_eq!(execution.concurrency, 2);
     }
 
     #[test]
-    fn test_cli_concurrency_override_takes_precedence() {
-        let inventory: Inventory = toml::from_str(INVENTORY).expect("inventory parses");
+    fn test_inventory_uses_default_concurrency_when_controller_missing() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            roles = ["server"]
+            bootstrap_expect = 1
+        "#,
+        )
+        .expect("inventory parses");
 
-        let execution = inventory
-            .resolve_execution(&args_with_concurrency(Some(1)), 2)
-            .expect("execution resolves");
-
-        assert_eq!(execution.concurrency, 1);
+        let execution = inventory.resolve_execution(5).expect("execution resolves");
+        assert_eq!(execution.concurrency, 3);
     }
 
     #[test]
@@ -658,14 +651,14 @@ mod tests {
             [[nodes]]
             name = "server-1"
             host = "server-1.example.com"
-            role = "server"
+            roles = ["server"]
             bootstrap_expect = 1
         "#,
         )
         .expect("inventory parses");
 
         let err = inventory
-            .resolve_execution(&args_with_concurrency(None), 1)
+            .resolve_execution(1)
             .expect_err("expected validation error");
         assert!(err.to_string().contains("greater than 0"));
     }
@@ -680,7 +673,7 @@ mod tests {
             [[nodes]]
             name = "server-1"
             host = "server-1.example.com"
-            role = "server"
+            roles = ["server"]
             bootstrap_expect = 1
 
             [nodes.ssh]
@@ -702,7 +695,6 @@ mod tests {
             preflight_only: true,
             dry_run: false,
             log_level: "info".to_string(),
-            concurrency: None,
         }
         .validated()
         .expect_err("expected invalid flag combination");
@@ -719,7 +711,7 @@ mod tests {
             [[nodes]]
             name = "client-1"
             host = "client-1.example.com"
-            role = "client"
+            roles = ["client"]
         "#,
         )
         .expect("inventory parses");
@@ -737,7 +729,7 @@ mod tests {
             [[nodes]]
             name = "server-1"
             host = "server-1.example.com"
-            role = "server"
+            roles = ["server"]
         "#,
         )
         .expect("inventory parses");
@@ -746,6 +738,91 @@ mod tests {
             .resolve_nodes()
             .expect_err("expected validation error");
         assert!(err.to_string().contains("bootstrap_expect"));
+    }
+
+    #[test]
+    fn test_legacy_role_field_is_rejected() {
+        let err = toml::from_str::<Inventory>(
+            r#"
+            [[nodes]]
+            name = "node-1"
+            host = "node-1.example.com"
+            role = "server"
+            bootstrap_expect = 1
+        "#,
+        )
+        .expect_err("expected schema validation error");
+
+        assert!(err.to_string().contains("unknown field `role`"));
+    }
+
+    #[test]
+    fn test_node_requires_at_least_one_role() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "node-1"
+            host = "node-1.example.com"
+            roles = []
+        "#,
+        )
+        .expect("inventory parses");
+
+        let err = inventory
+            .resolve_nodes()
+            .expect_err("expected validation error");
+        assert!(err.to_string().contains("must define at least one role"));
+    }
+
+    #[test]
+    fn test_node_rejects_duplicate_roles() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "node-1"
+            host = "node-1.example.com"
+            roles = ["server", "server"]
+            bootstrap_expect = 1
+        "#,
+        )
+        .expect("inventory parses");
+
+        let err = inventory
+            .resolve_nodes()
+            .expect_err("expected validation error");
+        assert!(err.to_string().contains("is duplicated"));
+    }
+
+    #[test]
+    fn test_dual_role_node_resolves_both_role_configs() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "node-1"
+            host = "node-1.example.com"
+            roles = ["server", "client"]
+            bootstrap_expect = 1
+            server_address = ["10.0.1.1:4647"]
+            server_join_address = ["10.0.1.2:4648"]
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        let node = &nodes[0].config;
+        assert_eq!(node.roles, vec![NodeRole::Server, NodeRole::Client]);
+        assert_eq!(
+            node.server_config()
+                .expect("server config")
+                .bootstrap_expect,
+            1
+        );
+        assert_eq!(
+            node.client_config()
+                .expect("client config")
+                .server_addresses,
+            vec!["10.0.1.1:4647".to_string()]
+        );
     }
 
     #[test]
@@ -761,7 +838,7 @@ mod tests {
             [[nodes]]
             name = "server-1"
             host = "server-1.example.com"
-            role = "server"
+            roles = ["server"]
             bootstrap_expect = 1
             bind_addr = "   "
         "#,
@@ -781,7 +858,7 @@ mod tests {
             [[nodes]]
             name = "server-1"
             host = "server-1.example.com"
-            role = "server"
+            roles = ["server"]
             bootstrap_expect = 1
 
             [nodes.advertise]

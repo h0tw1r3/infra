@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::debian::{normalize_config, DebianHost};
 use crate::executor::PhaseExecutor;
 use crate::models::{
-    ExecutionContext, LatencyProfile, NodeConfig, NodeRole, PhaseResult, ServerConfig,
+    ClientConfig, ExecutionContext, LatencyProfile, NodeConfig, NodeRole, PhaseResult, ServerConfig,
 };
 use crate::state::config_hash;
 
@@ -67,30 +67,12 @@ fn render_config(config: &NodeConfig) -> Result<String> {
         "}".to_string(),
     ];
 
-    match config.role {
-        NodeRole::Server => {
-            let server = config.server_config()?;
-            lines.extend(render_server_block(server));
-        }
-        NodeRole::Client => {
-            let client = config.client_config()?;
-            let servers = client
-                .server_addresses
-                .iter()
-                .map(|address| format!("  {},", render_hcl_string(address)))
-                .collect::<Vec<_>>()
-                .join("\n");
-            lines.extend([
-                String::new(),
-                "client {".to_string(),
-                "  enabled = true".to_string(),
-                "}".to_string(),
-                String::new(),
-                "servers = [".to_string(),
-                servers,
-                "]".to_string(),
-            ]);
-        }
+    if config.has_role(NodeRole::Server) {
+        lines.extend(render_server_block(config.server_config()?));
+    }
+
+    if config.has_role(NodeRole::Client) {
+        lines.extend(render_client_block(config.client_config()?));
     }
 
     if config.latency_profile == LatencyProfile::HighLatency {
@@ -129,6 +111,26 @@ fn render_server_block(server: &ServerConfig) -> Vec<String> {
 
     lines.push("}".to_string());
     lines
+}
+
+fn render_client_block(client: &ClientConfig) -> Vec<String> {
+    let servers = client
+        .server_addresses
+        .iter()
+        .map(|address| format!("  {},", render_hcl_string(address)))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    vec![
+        String::new(),
+        "client {".to_string(),
+        "  enabled = true".to_string(),
+        "}".to_string(),
+        String::new(),
+        "servers = [".to_string(),
+        servers,
+        "]".to_string(),
+    ]
 }
 
 struct RenderedAdvertise {
@@ -189,19 +191,35 @@ fn render_hcl_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{AdvertiseConfig, LatencyProfile, NodeRole};
+    use crate::models::{AdvertiseConfig, ClientConfig, LatencyProfile, NodeRole};
 
     fn server_node_config() -> NodeConfig {
         NodeConfig {
             name: "server-1".to_string(),
             datacenter: "homelab".to_string(),
             version: "1.7.6".to_string(),
-            role: NodeRole::Server,
+            roles: vec![NodeRole::Server],
             server_config: Some(ServerConfig {
                 bootstrap_expect: 3,
                 server_join_addresses: Vec::new(),
             }),
             client_config: None,
+            bind_addr: None,
+            advertise: AdvertiseConfig::default(),
+            latency_profile: LatencyProfile::Standard,
+        }
+    }
+
+    fn client_node_config() -> NodeConfig {
+        NodeConfig {
+            name: "client-1".to_string(),
+            datacenter: "homelab".to_string(),
+            version: "1.7.6".to_string(),
+            roles: vec![NodeRole::Client],
+            server_config: None,
+            client_config: Some(ClientConfig {
+                server_addresses: vec!["10.0.1.1:4647".to_string()],
+            }),
             bind_addr: None,
             advertise: AdvertiseConfig::default(),
             latency_profile: LatencyProfile::Standard,
@@ -295,5 +313,52 @@ mod tests {
         assert!(rendered.contains("  http = \"{{ GetInterfaceIP \\\"eth0\\\" }}\""));
         assert!(rendered.contains("  rpc  = \"{{ GetInterfaceIP \\\"eth0\\\" }}\""));
         assert!(rendered.contains("  serf = \"{{ GetInterfaceIP \\\"eth0\\\" }}\""));
+    }
+
+    #[test]
+    fn test_render_client_config() {
+        let rendered = render_config(&client_node_config()).expect("rendered config");
+        assert!(rendered.contains("client {"));
+        assert!(rendered.contains("enabled = true"));
+        assert!(rendered.contains("servers = ["));
+        assert!(rendered.contains("\"10.0.1.1:4647\""));
+        assert!(!rendered.contains("server {"));
+    }
+
+    #[test]
+    fn test_render_dual_role_config() {
+        let mut config = server_node_config();
+        config.roles.push(NodeRole::Client);
+        config.client_config = Some(ClientConfig {
+            server_addresses: vec!["10.0.1.1:4647".to_string()],
+        });
+
+        let rendered = render_config(&config).expect("rendered config");
+        assert!(rendered.contains("server {"));
+        assert!(rendered.contains("client {"));
+        assert!(rendered.contains("bootstrap_expect = 3"));
+        assert!(rendered.contains("\"10.0.1.1:4647\""));
+    }
+
+    #[test]
+    fn test_render_config_rejects_server_role_without_server_payload() {
+        let mut config = server_node_config();
+        config.server_config = None;
+
+        let err = render_config(&config).expect_err("expected invariant failure");
+        assert!(err
+            .to_string()
+            .contains("server configuration is not available for roles server"));
+    }
+
+    #[test]
+    fn test_render_config_rejects_client_role_without_client_payload() {
+        let mut config = client_node_config();
+        config.client_config = None;
+
+        let err = render_config(&config).expect_err("expected invariant failure");
+        assert!(err
+            .to_string()
+            .contains("client configuration is not available for roles client"));
     }
 }

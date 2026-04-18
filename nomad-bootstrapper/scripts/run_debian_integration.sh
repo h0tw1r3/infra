@@ -338,14 +338,14 @@ privilege_escalation = ["sudo", "-n"]
 [[nodes]]
 name = "${SERVER_ONE_NAME}"
 host = "${SERVER_ONE_NAME}"
-role = "server"
+roles = ["server"]
 bootstrap_expect = 2
 server_join_address = ["${SERVER_TWO_NAME}:4648"]
 
 [[nodes]]
 name = "${SERVER_TWO_NAME}"
 host = "${SERVER_TWO_NAME}"
-role = "server"
+roles = ["server"]
 bootstrap_expect = 2
 server_join_address = ["${SERVER_ONE_NAME}:4648"]
 EOF
