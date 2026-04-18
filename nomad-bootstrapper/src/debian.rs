@@ -2,10 +2,12 @@ use anyhow::Result;
 
 use crate::transport::{shell_quote, RemoteHost};
 
-pub const NOMAD_CONFIG_PATH: &str = "/etc/nomad.d/nomad.hcl";
-pub const HASHICORP_KEYRING_PATH: &str = "/usr/share/keyrings/hashicorp-archive-keyring.gpg";
-pub const HASHICORP_SOURCE_LIST_PATH: &str = "/etc/apt/sources.list.d/hashicorp.list";
-
+/// Debian-only remote host wrapper.
+///
+/// This layer owns generic Debian/APT operations such as package queries,
+/// upgradable checks, repository file writes, keyring fetches, and generic
+/// privileged file/service operations. Higher-level phases provide
+/// Nomad-specific package names, service names, repository paths, and content.
 pub struct DebianHost<'a> {
     remote: RemoteHost<'a>,
 }
@@ -40,14 +42,14 @@ impl<'a> DebianHost<'a> {
         }
     }
 
-    pub fn check_pkg(&self, pkg: &str) -> Result<bool> {
+    pub fn package_installed(&self, package: &str) -> Result<bool> {
         if self.remote.is_dry_run() {
             return Ok(false);
         }
 
         let output = self
             .remote
-            .run(&format!("dpkg -s {} >/dev/null 2>&1", shell_quote(pkg)))?;
+            .run(&format!("dpkg -s {} >/dev/null 2>&1", shell_quote(package)))?;
         Ok(output.success())
     }
 
@@ -60,34 +62,36 @@ impl<'a> DebianHost<'a> {
         parse_codename(&os_release)
     }
 
-    pub fn read_nomad_config(&self) -> Result<Option<String>> {
+    pub fn read_privileged_file(&self, path: &str) -> Result<Option<String>> {
         if self.remote.is_dry_run() {
             return Ok(None);
         }
-        self.remote.read_file_privileged(NOMAD_CONFIG_PATH)
+        self.remote.read_file_privileged(path)
     }
 
-    pub fn read_repo_file(&self) -> Result<Option<String>> {
+    pub fn read_apt_source_file(&self, path: &str) -> Result<Option<String>> {
         if self.remote.is_dry_run() {
             return Ok(None);
         }
-        self.remote.read_file(HASHICORP_SOURCE_LIST_PATH)
+        self.remote.read_file(path)
     }
 
-    pub fn keyring_exists(&self) -> Result<bool> {
-        self.remote.file_exists(HASHICORP_KEYRING_PATH)
+    pub fn apt_keyring_exists(&self, path: &str) -> Result<bool> {
+        self.remote.file_exists(path)
     }
 
-    pub fn installed_nomad_version(&self) -> Result<Option<String>> {
+    /// Returns the installed version of a package, or `None` if not installed.
+    pub fn installed_package_version(&self, package: &str) -> Result<Option<String>> {
         if self.remote.is_dry_run() {
             return Ok(None);
         }
-        let output = self.remote.run(
-            "if dpkg -s nomad >/dev/null 2>&1; then dpkg-query -W -f='${Version}' nomad; fi",
-        )?;
+        let package = shell_quote(package);
+        let output = self.remote.run(&format!(
+            "if dpkg -s {package} >/dev/null 2>&1; then dpkg-query -W -f='${{Version}}' {package}; fi",
+        ))?;
         if !output.success() {
             anyhow::bail!(
-                "host {} could not query installed nomad version: {}",
+                "host {} could not query installed package version: {}",
                 self.remote.label(),
                 output.stderr.trim()
             );
@@ -100,12 +104,15 @@ impl<'a> DebianHost<'a> {
         }
     }
 
-    pub fn nomad_version_satisfies(&self, desired: &str) -> Result<bool> {
+    /// Returns `true` if the installed version satisfies `desired`.
+    /// `"latest"` always returns `false` — use [`package_is_upgradable`] instead.
+    /// Strips Debian epoch and revision suffixes before comparing bare upstream versions.
+    pub fn package_version_satisfies(&self, package: &str, desired: &str) -> Result<bool> {
         if desired == "latest" {
             return Ok(false);
         }
 
-        let installed = match self.installed_nomad_version()? {
+        let installed = match self.installed_package_version(package)? {
             Some(value) => value,
             None => return Ok(false),
         };
@@ -113,39 +120,73 @@ impl<'a> DebianHost<'a> {
             return Ok(true);
         }
 
-        Ok(installed.split('-').next().unwrap_or(&installed) == desired)
+        // Debian versions: [epoch:]upstream[-revision]. Strip both to compare bare upstream.
+        let bare = installed
+            .split(':')
+            .next_back()
+            .unwrap_or(&installed)
+            .split('-')
+            .next()
+            .unwrap_or(&installed);
+        Ok(bare == desired)
     }
 
-    pub fn latest_nomad_needs_install(&self) -> Result<bool> {
+    /// Returns `true` if a newer candidate version is available for the package.
+    /// Uses `apt-cache policy` for reliable, stable output. Returns `true` in dry-run mode.
+    pub fn package_is_upgradable(&self, package: &str) -> Result<bool> {
         if self.remote.is_dry_run() {
             return Ok(true);
         }
 
-        if self.installed_nomad_version()?.is_none() {
-            return Ok(true);
-        }
-
-        let output = self.remote.run("apt list --upgradable nomad 2>&1")?;
+        let output = self
+            .remote
+            .run(&format!("apt-cache policy {}", shell_quote(package)))?;
         if !output.success() {
             anyhow::bail!(
-                "host {} could not determine whether nomad is upgradable: {}",
+                "host {} could not determine whether package {} is upgradable: {}",
                 self.remote.label(),
+                package,
                 output.stderr.trim()
             );
         }
 
-        Ok(output.stdout.contains("upgradable from"))
+        // Parse "Installed: X" and "Candidate: Y" from apt-cache policy output.
+        // A package is upgradable when both fields are present, non-empty, not "(none)",
+        // and the candidate version differs from the installed version.
+        let mut installed = None;
+        let mut candidate = None;
+        for line in output.stdout.lines() {
+            let line = line.trim();
+            if let Some(v) = line.strip_prefix("Installed:") {
+                installed = Some(v.trim().to_string());
+            } else if let Some(v) = line.strip_prefix("Candidate:") {
+                candidate = Some(v.trim().to_string());
+            }
+        }
+        match (installed, candidate) {
+            (Some(i), Some(c)) if i != "(none)" && c != "(none)" && i != c => Ok(true),
+            _ => Ok(false),
+        }
     }
 
-    pub fn write_repo_file(&self, content: &str) -> Result<()> {
+    /// Writes an APT source list file at `path` (mode 0o644, root-owned).
+    pub fn write_apt_source_file(&self, path: &str, content: &str) -> Result<()> {
         self.remote
-            .write_file_atomic_privileged(HASHICORP_SOURCE_LIST_PATH, content, 0o644)
+            .write_file_atomic_privileged(path, content, 0o644)
     }
 
-    pub fn fetch_hashicorp_keyring(&self) -> Result<()> {
+    /// Fetches a GPG key from `url`, dearmors it, and writes the keyring to `keyring_path`.
+    pub fn fetch_gpg_keyring(&self, url: &str, keyring_path: &str) -> Result<()> {
+        let parent_dir = std::path::Path::new(keyring_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/"))
+            .to_string_lossy()
+            .into_owned();
         let command = format!(
-            "set -eu; mkdir -p /usr/share/keyrings; tmp=$(mktemp /tmp/hashicorp-key.XXXXXX); curl -fsSL https://apt.releases.hashicorp.com/gpg -o \"$tmp\"; gpg --dearmor -o {keyring} \"$tmp\"; rm -f \"$tmp\"",
-            keyring = shell_quote(HASHICORP_KEYRING_PATH)
+            "set -eu; mkdir -p {parent}; tmp=$(mktemp /tmp/apt-key.XXXXXX); curl -fsSL {url} -o \"$tmp\"; gpg --dearmor -o {keyring} \"$tmp\"; rm -f \"$tmp\"",
+            parent = shell_quote(&parent_dir),
+            url = shell_quote(url),
+            keyring = shell_quote(keyring_path)
         );
         self.remote.run_privileged_checked(&command)?;
         Ok(())
@@ -167,27 +208,22 @@ impl<'a> DebianHost<'a> {
         Ok(())
     }
 
-    pub fn write_nomad_config(&self, config: &str) -> Result<()> {
-        let command = format!(
-            "set -eu; mkdir -p /etc/nomad.d; tmp=$(mktemp /etc/nomad.d/nomad.hcl.XXXXXX); cat > \"$tmp\"; chmod 640 \"$tmp\"; if nomad agent -h 2>/dev/null | grep -q -- -validate; then nomad agent -validate -config=\"$tmp\" >/dev/null; fi; mv \"$tmp\" {path}",
-            path = shell_quote(NOMAD_CONFIG_PATH)
-        );
+    /// Writes a privileged config file at `path` (mode 0o640, root-owned).
+    pub fn write_config(&self, path: &str, content: &str) -> Result<()> {
         self.remote
-            .run_privileged_with_input_checked(&command, config.as_bytes())?;
+            .write_file_atomic_privileged(path, content, 0o640)
+    }
+
+    /// Restarts a systemd service by name.
+    pub fn restart_service(&self, service: &str) -> Result<()> {
+        self.remote
+            .run_privileged_checked(&format!("systemctl restart {}", shell_quote(service)))?;
         Ok(())
     }
 
-    pub fn restart_nomad(&self) -> Result<()> {
-        self.remote
-            .run_privileged_checked("systemctl restart nomad")?;
-        Ok(())
-    }
-
-    pub fn nomad_version_output(&self) -> Result<String> {
-        if self.remote.is_dry_run() {
-            return Ok("Nomad vDRY-RUN".to_string());
-        }
-        Ok(self.remote.run_checked("nomad version")?.stdout)
+    /// Runs `command` on the remote host and returns its stdout.
+    pub fn command_output(&self, command: &str) -> Result<String> {
+        Ok(self.remote.run_checked(command)?.stdout)
     }
 }
 
@@ -213,10 +249,15 @@ pub fn parse_codename(content: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("could not determine VERSION_CODENAME from /etc/os-release"))
 }
 
-pub fn desired_repo_contents(codename: &str) -> String {
+pub fn apt_repo_contents(
+    signed_by_path: &str,
+    base_url: &str,
+    suite: &str,
+    component: &str,
+) -> String {
     format!(
-        "deb [signed-by={}] https://apt.releases.hashicorp.com {} main\n",
-        HASHICORP_KEYRING_PATH, codename
+        "deb [signed-by={}] {} {} {}\n",
+        signed_by_path, base_url, suite, component
     )
 }
 
@@ -233,6 +274,8 @@ pub fn normalize_config(config: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::{recording_target, RecordingTransport};
+    use crate::transport::{RemoteHost, RemoteOutput};
 
     #[test]
     fn test_parse_os_release() {
@@ -257,15 +300,134 @@ mod tests {
     }
 
     #[test]
-    fn test_desired_repo_contents() {
-        let repo = desired_repo_contents("bookworm");
+    fn test_apt_repo_contents() {
+        let repo = apt_repo_contents(
+            "/usr/share/keyrings/hashicorp-archive-keyring.gpg",
+            "https://apt.releases.hashicorp.com",
+            "bookworm",
+            "main",
+        );
         assert!(repo.contains("bookworm"));
-        assert!(repo.contains(HASHICORP_KEYRING_PATH));
+        assert!(repo.contains("/usr/share/keyrings/hashicorp-archive-keyring.gpg"));
+        assert!(repo.contains("https://apt.releases.hashicorp.com"));
     }
 
     #[test]
     fn test_normalize_config() {
         let config = "server {\n  enabled = true\n}\n\n";
         assert_eq!(normalize_config(config), "server {\n  enabled = true\n}");
+    }
+
+    #[test]
+    fn test_package_is_upgradable_detects_upgradable_output() {
+        let transport = RecordingTransport::new(vec![RemoteOutput {
+            status: 0,
+            stdout: "nomad:\n  Installed: 1.7.9\n  Candidate: 1.8.0\n".to_string(),
+            stderr: String::new(),
+        }]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+
+        assert!(host.package_is_upgradable("nomad").expect("package query"));
+        let commands = transport.commands.lock().expect("commands lock");
+        assert_eq!(commands[0], "apt-cache policy nomad");
+    }
+
+    #[test]
+    fn test_package_is_upgradable_detects_current_package() {
+        let transport = RecordingTransport::new(vec![RemoteOutput {
+            status: 0,
+            stdout: "nomad:\n  Installed: 1.8.0\n  Candidate: 1.8.0\n".to_string(),
+            stderr: String::new(),
+        }]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+
+        assert!(!host.package_is_upgradable("nomad").expect("package query"));
+    }
+
+    #[test]
+    fn test_package_version_satisfies_exact_match() {
+        let transport = RecordingTransport::new(vec![RemoteOutput {
+            status: 0,
+            stdout: "1.6.0-1\n".to_string(),
+            stderr: String::new(),
+        }]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+        assert!(host
+            .package_version_satisfies("nomad", "1.6.0-1")
+            .expect("version check"));
+    }
+
+    #[test]
+    fn test_package_version_satisfies_strips_revision() {
+        let transport = RecordingTransport::new(vec![RemoteOutput {
+            status: 0,
+            stdout: "1.6.0-1\n".to_string(),
+            stderr: String::new(),
+        }]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+        assert!(host
+            .package_version_satisfies("nomad", "1.6.0")
+            .expect("version check"));
+    }
+
+    #[test]
+    fn test_package_version_satisfies_strips_epoch() {
+        let transport = RecordingTransport::new(vec![RemoteOutput {
+            status: 0,
+            stdout: "1:1.6.0-1\n".to_string(),
+            stderr: String::new(),
+        }]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+        assert!(host
+            .package_version_satisfies("nomad", "1.6.0")
+            .expect("version check"));
+    }
+
+    #[test]
+    fn test_package_version_satisfies_no_match() {
+        let transport = RecordingTransport::new(vec![RemoteOutput {
+            status: 0,
+            stdout: "1.5.0-1\n".to_string(),
+            stderr: String::new(),
+        }]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+        assert!(!host
+            .package_version_satisfies("nomad", "1.6.0")
+            .expect("version check"));
+    }
+
+    #[test]
+    fn test_package_version_satisfies_package_missing() {
+        let transport = RecordingTransport::new(vec![RemoteOutput {
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        }]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+        assert!(!host
+            .package_version_satisfies("nomad", "1.6.0")
+            .expect("version check"));
+    }
+
+    #[test]
+    fn test_package_version_satisfies_latest_always_false() {
+        // "latest" is handled by a separate upgrade-check path; satisfies is always false
+        let transport = RecordingTransport::new(vec![RemoteOutput {
+            status: 0,
+            stdout: "1.6.0-1\n".to_string(),
+            stderr: String::new(),
+        }]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+        assert!(!host
+            .package_version_satisfies("nomad", "latest")
+            .expect("version check"));
     }
 }

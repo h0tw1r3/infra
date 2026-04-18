@@ -16,7 +16,7 @@ impl PhaseExecutor for EnsureDeps {
         let required_packages = ["curl", "gnupg", "ca-certificates"];
         let mut missing_packages = Vec::new();
         for package in required_packages {
-            if !host.check_pkg(package)? {
+            if !host.package_installed(package)? {
                 missing_packages.push(package.to_string());
             }
         }

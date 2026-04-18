@@ -15,17 +15,16 @@ impl PhaseExecutor for Install {
     ) -> Result<PhaseResult> {
         let is_latest = config.version == "latest";
         if is_latest {
-            if !host.latest_nomad_needs_install()? {
-                let installed_version = host
-                    .installed_nomad_version()?
-                    .unwrap_or_else(|| "latest".to_string());
-                ctx.state.update_provision(&installed_version);
-                return Ok(PhaseResult::unchanged(
-                    self.name(),
-                    "nomad is already at the latest available package version",
-                ));
+            if let Some(installed_version) = host.installed_package_version("nomad")? {
+                if !host.package_is_upgradable("nomad")? {
+                    ctx.state.update_provision(&installed_version);
+                    return Ok(PhaseResult::unchanged(
+                        self.name(),
+                        "nomad is already at the latest available package version",
+                    ));
+                }
             }
-        } else if host.nomad_version_satisfies(&config.version)? {
+        } else if host.package_version_satisfies("nomad", &config.version)? {
             ctx.state.update_provision(&config.version);
             return Ok(PhaseResult::unchanged(
                 self.name(),
@@ -41,7 +40,7 @@ impl PhaseExecutor for Install {
         host.apt_install(std::slice::from_ref(&package_spec))?;
 
         let provisioned_version = host
-            .installed_nomad_version()?
+            .installed_package_version("nomad")?
             .unwrap_or_else(|| config.version.clone());
         ctx.state.update_provision(&provisioned_version);
 
@@ -58,49 +57,10 @@ impl PhaseExecutor for Install {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
-    use crate::models::{AdvertiseConfig, LatencyProfile, NodeRole, ResolvedTarget};
-    use crate::transport::{RemoteHost, RemoteOutput, Transport};
-
-    struct RecordingTransport {
-        outputs: Mutex<Vec<RemoteOutput>>,
-        commands: Mutex<Vec<String>>,
-    }
-
-    impl RecordingTransport {
-        fn new(outputs: Vec<RemoteOutput>) -> Self {
-            Self {
-                outputs: Mutex::new(outputs.into_iter().rev().collect()),
-                commands: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl Transport for RecordingTransport {
-        fn is_dry_run(&self) -> bool {
-            false
-        }
-
-        fn exec(
-            &self,
-            _target: &ResolvedTarget,
-            command: &str,
-            _input: Option<&[u8]>,
-        ) -> Result<RemoteOutput> {
-            self.commands
-                .lock()
-                .expect("commands lock")
-                .push(command.to_string());
-            Ok(self
-                .outputs
-                .lock()
-                .expect("outputs lock")
-                .pop()
-                .expect("output"))
-        }
-    }
+    use crate::models::{AdvertiseConfig, LatencyProfile, NodeRole};
+    use crate::test_helpers::{recording_target, RecordingTransport};
+    use crate::transport::{RemoteHost, RemoteOutput};
 
     fn node_config(version: &str) -> NodeConfig {
         NodeConfig {
@@ -116,18 +76,6 @@ mod tests {
         }
     }
 
-    fn remote_target() -> ResolvedTarget {
-        ResolvedTarget {
-            name: "node-1".to_string(),
-            host: "node-1.example.com".to_string(),
-            user: None,
-            identity_file: None,
-            port: None,
-            options: Vec::new(),
-            privilege_escalation: None,
-        }
-    }
-
     #[test]
     fn test_latest_skips_install_when_nomad_is_not_upgradable() {
         let transport = RecordingTransport::new(vec![
@@ -138,7 +86,7 @@ mod tests {
             },
             RemoteOutput {
                 status: 0,
-                stdout: "Listing...\n".to_string(),
+                stdout: "nomad:\n  Installed: 1.8.0-1\n  Candidate: 1.8.0-1\n".to_string(),
                 stderr: String::new(),
             },
             RemoteOutput {
@@ -147,7 +95,7 @@ mod tests {
                 stderr: String::new(),
             },
         ]);
-        let target = remote_target();
+        let target = recording_target();
         let host = DebianHost::new(RemoteHost::new(&transport, &target));
         let mut ctx = ExecutionContext::default();
 
@@ -166,14 +114,70 @@ mod tests {
             commands[0],
             "if dpkg -s nomad >/dev/null 2>&1; then dpkg-query -W -f='${Version}' nomad; fi"
         );
-        assert_eq!(commands[1], "apt list --upgradable nomad 2>&1");
-        assert_eq!(
-            commands[2],
-            "if dpkg -s nomad >/dev/null 2>&1; then dpkg-query -W -f='${Version}' nomad; fi"
-        );
+        assert_eq!(commands[1], "apt-cache policy nomad");
         assert!(!commands
             .iter()
             .any(|command| command.contains("apt-get install")));
+    }
+
+    #[test]
+    fn test_latest_installs_when_nomad_is_upgradable() {
+        let transport = RecordingTransport::new(vec![
+            // installed_package_version → "1.7.0-1" (nomad is present)
+            RemoteOutput {
+                status: 0,
+                stdout: "1.7.0-1\n".to_string(),
+                stderr: String::new(),
+            },
+            // package_is_upgradable → upgradable from 1.7.0 to 1.8.0
+            RemoteOutput {
+                status: 0,
+                stdout: "nomad:\n  Installed: 1.7.0-1\n  Candidate: 1.8.0-1\n".to_string(),
+                stderr: String::new(),
+            },
+            // privilege check for apt-get
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            // apt-get install
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            // installed_package_version post-install → "1.8.0-1"
+            RemoteOutput {
+                status: 0,
+                stdout: "1.8.0-1\n".to_string(),
+                stderr: String::new(),
+            },
+        ]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+        let mut ctx = ExecutionContext::default();
+
+        let result = Install
+            .execute(&host, &node_config("latest"), &mut ctx)
+            .expect("install succeeds");
+
+        assert!(result.changes_made);
+        assert_eq!(result.message, "installed nomad");
+        assert_eq!(ctx.state.provisioned_version.as_deref(), Some("1.8.0-1"));
+
+        let commands = transport.commands.lock().expect("commands lock");
+        assert_eq!(
+            commands[0],
+            "if dpkg -s nomad >/dev/null 2>&1; then dpkg-query -W -f='${Version}' nomad; fi"
+        );
+        assert_eq!(commands[1], "apt-cache policy nomad");
+        assert_eq!(commands[2], "id -u");
+        assert_eq!(commands[3], "apt-get install -y -qq nomad");
+        assert_eq!(
+            commands[4],
+            "if dpkg -s nomad >/dev/null 2>&1; then dpkg-query -W -f='${Version}' nomad; fi"
+        );
     }
 
     #[test]
@@ -200,7 +204,7 @@ mod tests {
                 stderr: String::new(),
             },
         ]);
-        let target = remote_target();
+        let target = recording_target();
         let host = DebianHost::new(RemoteHost::new(&transport, &target));
         let mut ctx = ExecutionContext::default();
 

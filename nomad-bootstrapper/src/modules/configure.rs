@@ -9,6 +9,7 @@ use crate::state::config_hash;
 
 pub struct Configure;
 
+const NOMAD_CONFIG_PATH: &str = "/etc/nomad.d/nomad.hcl";
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0";
 const DEFAULT_ADVERTISE_ADDR: &str = "{{ GetInterfaceIP \"default\" }}";
 
@@ -20,7 +21,7 @@ impl PhaseExecutor for Configure {
         ctx: &mut ExecutionContext,
     ) -> Result<PhaseResult> {
         let desired_config = render_config(config)?;
-        let existing_config = host.read_nomad_config()?;
+        let existing_config = host.read_privileged_file(NOMAD_CONFIG_PATH)?;
 
         let matches = existing_config
             .as_deref()
@@ -36,7 +37,7 @@ impl PhaseExecutor for Configure {
             ));
         }
 
-        host.write_nomad_config(&desired_config)?;
+        host.write_config(NOMAD_CONFIG_PATH, &desired_config)?;
         ctx.state.update_config_hash(&config_hash(&desired_config));
         ctx.mark_restart_required();
 

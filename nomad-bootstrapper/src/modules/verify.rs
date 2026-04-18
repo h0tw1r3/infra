@@ -16,12 +16,12 @@ impl PhaseExecutor for Verify {
         let mut actions = Vec::new();
 
         if ctx.restart_required() {
-            host.restart_nomad()?;
+            host.restart_service("nomad")?;
             ctx.clear_restart_required();
             actions.push("restarted nomad service".to_string());
         }
 
-        let version_output = host.nomad_version_output()?;
+        let version_output = host.command_output("nomad version")?;
         if config.version != "latest" && !version_output.contains(&config.version) {
             anyhow::bail!(
                 "installed nomad version does not match requested version {}: {}",
