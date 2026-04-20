@@ -291,13 +291,13 @@ impl Inventory {
         let server_join_addresses = node
             .server_join_address
             .iter()
-            .map(|value| validate_address(value))
+            .map(|value| validate_address(value, 4648))
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|err| anyhow::anyhow!("node '{}': {}", name, err))?;
         let server_addresses = node
             .server_address
             .iter()
-            .map(|value| validate_address(value))
+            .map(|value| validate_address(value, 4647))
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|err| anyhow::anyhow!("node '{}': {}", name, err))?;
         let bind_addr = normalize_nomad_config_value(node.bind_addr.as_deref(), name, "bind_addr")?;
@@ -512,16 +512,18 @@ fn resolve_advertise(
     }
 }
 
-fn validate_address(val: &str) -> std::result::Result<String, String> {
+fn validate_address(val: &str, default_port: u16) -> std::result::Result<String, String> {
     let val = val.trim();
     if val.is_empty() {
         return Err("address cannot be empty".to_string());
     }
 
+    // Bare IP with no port — append the default.
     if val.parse::<IpAddr>().is_ok() {
-        return Ok(val.to_string());
+        return Ok(format!("{}:{}", val, default_port));
     }
 
+    // Bracketed IPv6: [::1] or [::1]:port
     if val.starts_with('[') {
         if let Some(bracket_end) = val.find(']') {
             let ip_part = &val[1..bracket_end];
@@ -539,13 +541,14 @@ fn validate_address(val: &str) -> std::result::Result<String, String> {
                 if port == 0 {
                     return Err(format!("invalid port in '{}': port must be 1-65535", val));
                 }
+                return Ok(val.to_string());
             }
-            return Ok(val.to_string());
+            return Ok(format!("{}:{}", val, default_port));
         }
         return Err(format!("missing closing ']' in '{}'", val));
     }
 
-    let (host, _) = if let Some(idx) = val.rfind(':') {
+    let (host, has_port) = if let Some(idx) = val.rfind(':') {
         let maybe_port = &val[idx + 1..];
         if maybe_port.chars().all(|c| c.is_ascii_digit()) && !maybe_port.is_empty() {
             let port: u16 = maybe_port
@@ -554,16 +557,20 @@ fn validate_address(val: &str) -> std::result::Result<String, String> {
             if port == 0 {
                 return Err(format!("invalid port in '{}': port must be 1-65535", val));
             }
-            (&val[..idx], Some(port))
+            (&val[..idx], true)
         } else {
-            (val, None)
+            (val, false)
         }
     } else {
-        (val, None)
+        (val, false)
     };
 
     if host.parse::<IpAddr>().is_ok() {
-        return Ok(val.to_string());
+        return if has_port {
+            Ok(val.to_string())
+        } else {
+            Ok(format!("{}:{}", val, default_port))
+        };
     }
 
     if host.is_empty() || host.len() > 253 {
@@ -593,7 +600,11 @@ fn validate_address(val: &str) -> std::result::Result<String, String> {
         }
     }
 
-    Ok(val.to_string())
+    if has_port {
+        Ok(val.to_string())
+    } else {
+        Ok(format!("{}:{}", val, default_port))
+    }
 }
 
 #[cfg(test)]
@@ -932,8 +943,85 @@ mod tests {
 
     #[test]
     fn test_validate_address_rejects_invalid_hostname() {
-        let err = validate_address("bad host").expect_err("expected invalid hostname");
+        let err = validate_address("bad host", 4647).expect_err("expected invalid hostname");
         assert!(err.contains("invalid characters"));
+    }
+
+    #[test]
+    fn test_validate_address_appends_default_port_bare_ip() {
+        assert_eq!(
+            validate_address("172.16.20.8", 4647).unwrap(),
+            "172.16.20.8:4647"
+        );
+        assert_eq!(
+            validate_address("172.16.20.8", 4648).unwrap(),
+            "172.16.20.8:4648"
+        );
+    }
+
+    #[test]
+    fn test_validate_address_preserves_explicit_port() {
+        assert_eq!(
+            validate_address("172.16.20.8:9999", 4647).unwrap(),
+            "172.16.20.8:9999"
+        );
+    }
+
+    #[test]
+    fn test_validate_address_appends_default_port_hostname() {
+        assert_eq!(
+            validate_address("server-1.example.com", 4647).unwrap(),
+            "server-1.example.com:4647"
+        );
+    }
+
+    #[test]
+    fn test_server_address_without_port_gets_default_4647() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "client-1"
+            host = "client-1.example.com"
+            roles = ["client"]
+            server_address = ["172.16.20.8"]
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        assert_eq!(
+            nodes[0]
+                .config
+                .client_config()
+                .expect("client config")
+                .server_addresses,
+            vec!["172.16.20.8:4647".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_server_join_address_without_port_gets_default_4648() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            roles = ["server"]
+            bootstrap_expect = 1
+            server_join_address = ["10.0.1.2"]
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        assert_eq!(
+            nodes[0]
+                .config
+                .server_config()
+                .expect("server config")
+                .server_join_addresses,
+            vec!["10.0.1.2:4648".to_string()]
+        );
     }
 
     #[test]
