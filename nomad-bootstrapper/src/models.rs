@@ -65,10 +65,11 @@ pub struct AdvertiseConfig {
 /// fixtures should preserve this invariant because configuration rendering
 /// branches on `roles` and then reads the matching role-specific payload.
 ///
-/// `cni_version` is structurally present for all nodes but only consumed
-/// when the node has the `client` role. Server-only nodes carry the field
-/// but it has no operational effect.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `cni_version` and `plugins` are structurally present for all nodes but
+/// only consumed when the node has the `client` role. Non-client nodes carry
+/// these fields with no operational effect; non-client nodes with non-empty
+/// `plugins` emit a warning during the configure phase and skip rendering.
+#[derive(Clone, Debug, PartialEq)]
 pub struct NodeConfig {
     pub name: String,
     pub datacenter: String,
@@ -81,6 +82,10 @@ pub struct NodeConfig {
     pub advertise: AdvertiseConfig,
     pub latency_profile: LatencyProfile,
     pub env_vars: HashMap<String, String>,
+    /// Task driver plugin configuration, deep-merged from inventory defaults and
+    /// per-node overrides. Present for all nodes; rendered into `nomad.hcl` only
+    /// when the client role is present.
+    pub plugins: HashMap<String, toml::Table>,
 }
 
 impl NodeConfig {
@@ -132,7 +137,7 @@ impl ResolvedTarget {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedNode {
     pub target: ResolvedTarget,
     pub config: NodeConfig,
@@ -205,6 +210,7 @@ mod tests {
             advertise: AdvertiseConfig::default(),
             latency_profile: LatencyProfile::Standard,
             env_vars: Default::default(),
+            plugins: Default::default(),
         }
     }
 

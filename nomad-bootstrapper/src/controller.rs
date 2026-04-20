@@ -247,6 +247,7 @@ mod tests {
                     advertise: AdvertiseConfig::default(),
                     latency_profile: LatencyProfile::Standard,
                     env_vars: Default::default(),
+                    plugins: Default::default(),
                 },
             },
             ResolvedNode {
@@ -274,6 +275,7 @@ mod tests {
                     advertise: AdvertiseConfig::default(),
                     latency_profile: LatencyProfile::Standard,
                     env_vars: Default::default(),
+                    plugins: Default::default(),
                 },
             },
         ]

@@ -95,6 +95,10 @@ pub struct DefaultsConfig {
     pub nomad_version: Option<String>,
     pub high_latency: Option<bool>,
     pub cni_version: Option<String>,
+    /// Default task driver plugin config applied to all client nodes.
+    /// Deep-merged with per-node plugin overrides; node values win on conflict.
+    #[serde(default)]
+    pub plugins: HashMap<String, toml::Table>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -184,6 +188,11 @@ pub struct NodeInventory {
     pub ssh: Option<SshConfig>,
     #[serde(default)]
     pub env_vars: HashMap<String, String>,
+    /// Per-node task driver plugin overrides. Deep-merged on top of
+    /// `[defaults.plugins]`; node scalars win, nested tables recurse.
+    /// Absent field defaults to an empty map for backward compatibility.
+    #[serde(default)]
+    pub plugins: HashMap<String, toml::Table>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -295,6 +304,18 @@ impl Inventory {
         let advertise = resolve_advertise(node.advertise.as_ref(), name)?;
         let mut env_vars = self.cluster.env_vars.clone();
         env_vars.extend(node.env_vars.clone());
+
+        // Plugins: start from defaults, deep-merge per-node overrides on top.
+        // Each plugin is merged independently to preserve cross-plugin isolation.
+        let mut plugins = self.defaults.plugins.clone();
+        for (driver, node_plugin) in &node.plugins {
+            let merged = match plugins.remove(driver) {
+                Some(base) => deep_merge_plugin_config(base, node_plugin.clone()),
+                None => node_plugin.clone(),
+            };
+            plugins.insert(driver.clone(), merged);
+        }
+
         let server_config = if roles.contains(&NodeRole::Server) {
             let bootstrap_expect = node.bootstrap_expect.ok_or_else(|| {
                 anyhow::anyhow!("node '{}' requires bootstrap_expect for server role", name)
@@ -339,6 +360,7 @@ impl Inventory {
             advertise,
             latency_profile,
             env_vars,
+            plugins,
         };
 
         Ok(ResolvedNode {
@@ -364,6 +386,30 @@ fn normalize_escalation(value: Option<Vec<String>>) -> Option<Vec<String>> {
         Some(values) if values.is_empty() => None,
         other => other,
     }
+}
+
+/// Deep-merges two plugin config tables.
+///
+/// Rules:
+/// - When both values for a key are tables, recurse.
+/// - Otherwise, `override_table` wins regardless of type (scalar beats table,
+///   table beats scalar, scalar beats scalar).
+/// - Keys present only in `base` are inherited unchanged.
+/// - Keys present only in `override_table` are added.
+pub fn deep_merge_plugin_config(base: toml::Table, override_table: toml::Table) -> toml::Table {
+    let mut result = base;
+    for (key, override_val) in override_table {
+        let merged = match (result.remove(&key), override_val) {
+            (Some(toml::Value::Table(base_inner)), toml::Value::Table(over_inner)) => {
+                toml::Value::Table(deep_merge_plugin_config(base_inner, over_inner))
+            }
+            // Override wins for all other type combinations (scalar/table mismatch,
+            // scalar/scalar, or key absent in base).
+            (_, val) => val,
+        };
+        result.insert(key, merged);
+    }
+    result
 }
 
 fn validate_privilege_escalation(
@@ -1029,5 +1075,209 @@ mod tests {
 
         let nodes = inventory.resolve_nodes().expect("nodes resolve");
         assert_eq!(nodes[0].config.cni_version, "v1.6.2");
+    }
+
+    // ── Plugin config resolution tests ──────────────────────────────────────
+
+    fn make_table(pairs: &[(&str, toml::Value)]) -> toml::Table {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn test_deep_merge_plugin_config_empty_base_returns_override() {
+        let base = toml::Table::new();
+        let over = make_table(&[("enabled", toml::Value::Boolean(true))]);
+        let result = deep_merge_plugin_config(base, over);
+        assert_eq!(result["enabled"], toml::Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_deep_merge_plugin_config_empty_override_returns_base() {
+        let base = make_table(&[("enabled", toml::Value::Boolean(false))]);
+        let over = toml::Table::new();
+        let result = deep_merge_plugin_config(base, over);
+        assert_eq!(result["enabled"], toml::Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_deep_merge_plugin_config_scalar_override_wins() {
+        let base = make_table(&[("enabled", toml::Value::Boolean(false))]);
+        let over = make_table(&[("enabled", toml::Value::Boolean(true))]);
+        let result = deep_merge_plugin_config(base, over);
+        assert_eq!(result["enabled"], toml::Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_deep_merge_plugin_config_nested_tables_recurse() {
+        let inner_base = make_table(&[
+            ("enabled", toml::Value::Boolean(true)),
+            ("selinuxlabel", toml::Value::String("z".to_string())),
+        ]);
+        let base = make_table(&[("volumes", toml::Value::Table(inner_base))]);
+
+        let inner_over = make_table(&[("enabled", toml::Value::Boolean(false))]);
+        let over = make_table(&[("volumes", toml::Value::Table(inner_over))]);
+
+        let result = deep_merge_plugin_config(base, over);
+        let volumes = result["volumes"].as_table().expect("volumes is table");
+        // Override wins for the key it sets.
+        assert_eq!(volumes["enabled"], toml::Value::Boolean(false));
+        // Base key not in override is inherited.
+        assert_eq!(
+            volumes["selinuxlabel"],
+            toml::Value::String("z".to_string())
+        );
+    }
+
+    #[test]
+    fn test_deep_merge_plugin_config_type_conflict_override_wins() {
+        // Default is a table; node override is a scalar — override replaces base.
+        let inner = make_table(&[("nested", toml::Value::Boolean(true))]);
+        let base = make_table(&[("key", toml::Value::Table(inner))]);
+        let over = make_table(&[("key", toml::Value::Boolean(false))]);
+        let result = deep_merge_plugin_config(base, over);
+        assert_eq!(result["key"], toml::Value::Boolean(false));
+
+        // Default is a scalar; node override is a table — override replaces base.
+        let base2 = make_table(&[("key", toml::Value::Boolean(true))]);
+        let inner2 = make_table(&[("nested", toml::Value::Boolean(false))]);
+        let over2 = make_table(&[("key", toml::Value::Table(inner2))]);
+        let result2 = deep_merge_plugin_config(base2, over2);
+        assert!(result2["key"].is_table());
+    }
+
+    #[test]
+    fn test_plugins_resolved_defaults_only() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [defaults.plugins.raw_exec]
+            enabled = true
+
+            [[nodes]]
+            name = "client-1"
+            host = "client-1.example.com"
+            roles = ["client"]
+            server_address = ["10.0.1.1:4647"]
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        let plugins = &nodes[0].config.plugins;
+        assert_eq!(plugins["raw_exec"]["enabled"], toml::Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_plugins_resolved_node_only() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "client-1"
+            host = "client-1.example.com"
+            roles = ["client"]
+            server_address = ["10.0.1.1:4647"]
+
+            [nodes.plugins.docker]
+            allow_privileged = false
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        let plugins = &nodes[0].config.plugins;
+        assert_eq!(
+            plugins["docker"]["allow_privileged"],
+            toml::Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_plugins_resolved_deep_merge_with_multi_plugin_boundary() {
+        // Defaults: docker (allow_privileged=false, volumes table) + raw_exec (enabled=false).
+        // Node overrides: raw_exec enabled=true (docker untouched), docker.allow_privileged=true.
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [defaults.plugins.docker]
+            allow_privileged = false
+            [defaults.plugins.docker.volumes]
+            enabled = true
+            selinuxlabel = "z"
+
+            [defaults.plugins.raw_exec]
+            enabled = false
+
+            [[nodes]]
+            name = "client-1"
+            host = "client-1.example.com"
+            roles = ["client"]
+            server_address = ["10.0.1.1:4647"]
+
+            [nodes.plugins.raw_exec]
+            enabled = true
+
+            [nodes.plugins.docker]
+            allow_privileged = true
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        let plugins = &nodes[0].config.plugins;
+
+        // raw_exec: node override wins.
+        assert_eq!(plugins["raw_exec"]["enabled"], toml::Value::Boolean(true));
+        // docker.allow_privileged: node override wins.
+        assert_eq!(
+            plugins["docker"]["allow_privileged"],
+            toml::Value::Boolean(true)
+        );
+        // docker.volumes: inherited from defaults (node didn't override it).
+        let volumes = plugins["docker"]["volumes"]
+            .as_table()
+            .expect("volumes table");
+        assert_eq!(volumes["enabled"], toml::Value::Boolean(true));
+        assert_eq!(
+            volumes["selinuxlabel"],
+            toml::Value::String("z".to_string())
+        );
+    }
+
+    #[test]
+    fn test_plugins_empty_when_not_configured() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            roles = ["server"]
+            bootstrap_expect = 1
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        assert!(nodes[0].config.plugins.is_empty());
+    }
+
+    #[test]
+    fn test_plugins_deserialization_absent_field_defaults_to_empty() {
+        // An inventory with no `plugins` key must still deserialize cleanly.
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "client-1"
+            host = "client-1.example.com"
+            roles = ["client"]
+            server_address = ["10.0.1.1:4647"]
+        "#,
+        )
+        .expect("inventory parses without plugins key");
+
+        assert!(inventory.defaults.plugins.is_empty());
+        let node = &inventory.nodes[0];
+        assert!(node.plugins.is_empty());
     }
 }

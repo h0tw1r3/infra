@@ -193,6 +193,21 @@ fn render_config(config: &NodeConfig) -> Result<String> {
 
     if config.has_role(NodeRole::Client) {
         lines.extend(render_client_block(config.client_config()?));
+        if !config.plugins.is_empty() {
+            lines.extend(render_plugin_blocks(&config.plugins)?);
+        }
+    } else if !config.plugins.is_empty() {
+        // Non-client nodes cannot use plugin config; warn and skip rendering.
+        let plugin_names: Vec<&str> = {
+            let mut names: Vec<&str> = config.plugins.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            names
+        };
+        warn!(
+            "node \"{}\" has plugins configured ({}) but has no client role; skipping plugin rendering",
+            config.name,
+            plugin_names.join(", ")
+        );
     }
 
     if config.latency_profile == LatencyProfile::HighLatency {
@@ -308,6 +323,117 @@ fn render_hcl_string(value: &str) -> String {
     format!("\"{}\"", escaped)
 }
 
+/// Renders all plugin stanzas for a client node.
+///
+/// Plugin names are sorted alphabetically for deterministic output. Each plugin
+/// is wrapped as:
+/// ```hcl
+/// plugin "<name>" {
+///   config {
+///     <key = value pairs, sorted alphabetically at every nesting level>
+///   }
+/// }
+/// ```
+fn render_plugin_blocks(plugins: &HashMap<String, toml::Table>) -> Result<Vec<String>> {
+    let mut plugin_names: Vec<&str> = plugins.keys().map(String::as_str).collect();
+    plugin_names.sort_unstable();
+
+    let mut lines = Vec::new();
+    for name in plugin_names {
+        let table = &plugins[name];
+        lines.push(String::new());
+        lines.push(format!("plugin {} {{", render_hcl_string(name)));
+        lines.push("  config {".to_string());
+        for line in render_plugin_table(table, 4)? {
+            lines.push(line);
+        }
+        lines.push("  }".to_string());
+        lines.push("}".to_string());
+    }
+    Ok(lines)
+}
+
+/// Recursively renders a `toml::Table` as indented HCL key/value lines.
+///
+/// Keys within a table are sorted alphabetically at every level for deterministic
+/// output. Nested tables become HCL block syntax. Arrays must contain only scalar
+/// values; arrays containing tables or mixed types return an error.
+fn render_plugin_table(table: &toml::Table, indent: usize) -> Result<Vec<String>> {
+    let prefix = " ".repeat(indent);
+    let mut keys: Vec<&str> = table.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+
+    let mut lines = Vec::new();
+    for key in keys {
+        let val = &table[key];
+        match val {
+            toml::Value::Table(inner) => {
+                lines.push(format!("{}{} {{", prefix, key));
+                for line in render_plugin_table(inner, indent + 2)? {
+                    lines.push(line);
+                }
+                lines.push(format!("{}}}", prefix));
+            }
+            toml::Value::Array(arr) => {
+                let rendered = render_plugin_array(arr, key)?;
+                lines.push(format!("{}{} = {}", prefix, key, rendered));
+            }
+            scalar => {
+                let rendered = render_plugin_scalar(scalar, key)?;
+                lines.push(format!("{}{} = {}", prefix, key, rendered));
+            }
+        }
+    }
+    Ok(lines)
+}
+
+/// Renders an array of scalar values as an HCL array literal `[v1, v2, ...]`.
+///
+/// Arrays containing tables or mixed types (non-homogeneous scalars are fine)
+/// return an error because Nomad/HCL does not support arrays-of-tables in
+/// plugin config and we must not silently produce malformed output.
+fn render_plugin_array(arr: &[toml::Value], key: &str) -> Result<String> {
+    let mut parts = Vec::with_capacity(arr.len());
+    for item in arr {
+        match item {
+            toml::Value::Table(_) => {
+                anyhow::bail!(
+                    "plugin config key '{}': arrays of tables are not supported; \
+                     use a nested table block instead",
+                    key
+                );
+            }
+            toml::Value::Array(_) => {
+                anyhow::bail!(
+                    "plugin config key '{}': nested arrays are not supported",
+                    key
+                );
+            }
+            scalar => {
+                parts.push(render_plugin_scalar(scalar, key)?);
+            }
+        }
+    }
+    Ok(format!("[{}]", parts.join(", ")))
+}
+
+/// Renders a single TOML scalar value to its HCL representation.
+fn render_plugin_scalar(val: &toml::Value, key: &str) -> Result<String> {
+    match val {
+        toml::Value::Boolean(b) => Ok(b.to_string()),
+        toml::Value::Integer(i) => Ok(i.to_string()),
+        toml::Value::Float(f) => Ok(f.to_string()),
+        toml::Value::String(s) => Ok(render_hcl_string(s)),
+        toml::Value::Datetime(dt) => Ok(render_hcl_string(&dt.to_string())),
+        toml::Value::Table(_) | toml::Value::Array(_) => {
+            anyhow::bail!(
+                "plugin config key '{}': unexpected composite value in scalar context",
+                key
+            );
+        }
+    }
+}
+
 /// Ensures `br_netfilter` is loaded and the sysctl bridge settings are in place.
 ///
 /// Steps (ordered; each is idempotent):
@@ -351,6 +477,7 @@ fn ensure_br_netfilter(host: &DebianHost<'_>) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::debian::normalize_config;
     use crate::models::{AdvertiseConfig, ClientConfig, LatencyProfile, NodeRole};
 
     fn server_node_config() -> NodeConfig {
@@ -369,6 +496,7 @@ mod tests {
             advertise: AdvertiseConfig::default(),
             latency_profile: LatencyProfile::Standard,
             env_vars: Default::default(),
+            plugins: Default::default(),
         }
     }
 
@@ -387,6 +515,7 @@ mod tests {
             advertise: AdvertiseConfig::default(),
             latency_profile: LatencyProfile::Standard,
             env_vars: Default::default(),
+            plugins: Default::default(),
         }
     }
 
@@ -925,5 +1054,238 @@ mod tests {
         assert!(commands
             .iter()
             .any(|c| c.contains("sysctl -p") && c.contains("nomad-bridge.conf")));
+    }
+
+    // ── Plugin rendering tests ───────────────────────────────────────────────
+
+    fn make_plugin_table(pairs: &[(&str, toml::Value)]) -> toml::Table {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn test_render_plugin_blocks_empty_produces_no_lines() {
+        let plugins = HashMap::new();
+        let lines = render_plugin_blocks(&plugins).expect("render succeeds");
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn test_render_plugin_blocks_single_flat_plugin() {
+        let table = make_plugin_table(&[("enabled", toml::Value::Boolean(true))]);
+        let mut plugins = HashMap::new();
+        plugins.insert("raw_exec".to_string(), table);
+
+        let output = render_plugin_blocks(&plugins)
+            .expect("render succeeds")
+            .join("\n");
+
+        assert!(output.contains("plugin \"raw_exec\" {"), "plugin wrapper");
+        assert!(output.contains("config {"), "config block");
+        assert!(output.contains("    enabled = true"), "scalar value");
+    }
+
+    #[test]
+    fn test_render_plugin_blocks_nested_table() {
+        let volumes = make_plugin_table(&[
+            ("enabled", toml::Value::Boolean(true)),
+            ("selinuxlabel", toml::Value::String("z".to_string())),
+        ]);
+        let table = make_plugin_table(&[
+            ("allow_privileged", toml::Value::Boolean(false)),
+            ("volumes", toml::Value::Table(volumes)),
+        ]);
+        let mut plugins = HashMap::new();
+        plugins.insert("docker".to_string(), table);
+
+        let output = render_plugin_blocks(&plugins)
+            .expect("render succeeds")
+            .join("\n");
+
+        assert!(output.contains("plugin \"docker\" {"));
+        assert!(output.contains("allow_privileged = false"));
+        assert!(output.contains("volumes {"));
+        assert!(output.contains("enabled = true"));
+        assert!(output.contains("selinuxlabel = \"z\""));
+    }
+
+    #[test]
+    fn test_render_plugin_blocks_multi_plugin_sorted_output() {
+        let mut plugins = HashMap::new();
+        plugins.insert(
+            "raw_exec".to_string(),
+            make_plugin_table(&[("enabled", toml::Value::Boolean(true))]),
+        );
+        plugins.insert(
+            "docker".to_string(),
+            make_plugin_table(&[("allow_privileged", toml::Value::Boolean(false))]),
+        );
+
+        let output = render_plugin_blocks(&plugins)
+            .expect("render succeeds")
+            .join("\n");
+
+        let docker_pos = output.find("plugin \"docker\"").expect("docker present");
+        let raw_exec_pos = output
+            .find("plugin \"raw_exec\"")
+            .expect("raw_exec present");
+        assert!(
+            docker_pos < raw_exec_pos,
+            "docker must come before raw_exec (alphabetical)"
+        );
+    }
+
+    #[test]
+    fn test_render_plugin_blocks_keys_sorted_within_block() {
+        let table = make_plugin_table(&[
+            ("z_key", toml::Value::Boolean(true)),
+            ("a_key", toml::Value::Boolean(false)),
+        ]);
+        let mut plugins = HashMap::new();
+        plugins.insert("raw_exec".to_string(), table);
+
+        let output = render_plugin_blocks(&plugins)
+            .expect("render succeeds")
+            .join("\n");
+
+        let a_pos = output.find("a_key").expect("a_key present");
+        let z_pos = output.find("z_key").expect("z_key present");
+        assert!(a_pos < z_pos, "a_key must come before z_key (alphabetical)");
+    }
+
+    #[test]
+    fn test_render_plugin_blocks_array_of_scalars() {
+        let table = make_plugin_table(&[(
+            "allowed_images",
+            toml::Value::Array(vec![
+                toml::Value::String("nginx:latest".to_string()),
+                toml::Value::String("redis:7".to_string()),
+            ]),
+        )]);
+        let mut plugins = HashMap::new();
+        plugins.insert("docker".to_string(), table);
+
+        let output = render_plugin_blocks(&plugins)
+            .expect("render succeeds")
+            .join("\n");
+
+        assert!(output.contains("allowed_images = [\"nginx:latest\", \"redis:7\"]"));
+    }
+
+    #[test]
+    fn test_render_plugin_blocks_array_of_tables_returns_error() {
+        let inner = make_plugin_table(&[("key", toml::Value::Boolean(true))]);
+        let table = make_plugin_table(&[(
+            "bad_array",
+            toml::Value::Array(vec![toml::Value::Table(inner)]),
+        )]);
+        let mut plugins = HashMap::new();
+        plugins.insert("docker".to_string(), table);
+
+        let err = render_plugin_blocks(&plugins).expect_err("should fail");
+        assert!(
+            err.to_string()
+                .contains("arrays of tables are not supported"),
+            "error message must explain the restriction: {}",
+            err
+        );
+    }
+
+    // ── Role gating tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_render_config_client_with_plugins_renders_plugin_blocks() {
+        let table = make_plugin_table(&[("enabled", toml::Value::Boolean(true))]);
+        let mut config = client_node_config();
+        config.plugins.insert("raw_exec".to_string(), table);
+
+        let rendered = render_config(&config).expect("render succeeds");
+        assert!(
+            rendered.contains("plugin \"raw_exec\""),
+            "plugin block must appear in rendered HCL"
+        );
+        assert!(rendered.contains("enabled = true"));
+    }
+
+    #[test]
+    fn test_render_config_server_only_with_plugins_omits_plugin_blocks() {
+        let table = make_plugin_table(&[("enabled", toml::Value::Boolean(true))]);
+        let mut config = server_node_config();
+        config.plugins.insert("raw_exec".to_string(), table);
+
+        let rendered = render_config(&config).expect("render succeeds");
+        assert!(
+            !rendered.contains("plugin \"raw_exec\""),
+            "server-only node must not render plugin blocks"
+        );
+    }
+
+    #[test]
+    fn test_render_config_dual_role_with_plugins_renders_plugin_blocks() {
+        let table = make_plugin_table(&[("allow_privileged", toml::Value::Boolean(false))]);
+        let mut config = client_node_config();
+        // Elevate to dual role.
+        config.roles = vec![NodeRole::Server, NodeRole::Client];
+        config.server_config = Some(ServerConfig {
+            bootstrap_expect: 1,
+            server_join_addresses: Vec::new(),
+        });
+        config.plugins.insert("docker".to_string(), table);
+
+        let rendered = render_config(&config).expect("render succeeds");
+        assert!(
+            rendered.contains("plugin \"docker\""),
+            "dual-role node must render plugin blocks"
+        );
+    }
+
+    #[test]
+    fn test_render_config_empty_plugins_produces_no_plugin_stanzas() {
+        let rendered = render_config(&client_node_config()).expect("render succeeds");
+        assert!(
+            !rendered.contains("plugin "),
+            "no plugins configured → no plugin stanzas"
+        );
+    }
+
+    // ── Restart semantics tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_render_config_plugin_determinism_same_input_same_normalized_output() {
+        let table = make_plugin_table(&[
+            ("enabled", toml::Value::Boolean(true)),
+            ("allow_privileged", toml::Value::Boolean(false)),
+        ]);
+        let mut config = client_node_config();
+        config.plugins.insert("docker".to_string(), table);
+
+        let first = render_config(&config).expect("first render");
+        let second = render_config(&config).expect("second render");
+        assert_eq!(
+            normalize_config(&first),
+            normalize_config(&second),
+            "identical input must produce identical normalized output"
+        );
+    }
+
+    #[test]
+    fn test_render_config_plugin_diff_sensitivity_changed_value_triggers_diff() {
+        let table_before = make_plugin_table(&[("allow_privileged", toml::Value::Boolean(false))]);
+        let table_after = make_plugin_table(&[("allow_privileged", toml::Value::Boolean(true))]);
+
+        let mut config = client_node_config();
+        config.plugins.insert("docker".to_string(), table_before);
+        let before = render_config(&config).expect("before render");
+
+        config.plugins.insert("docker".to_string(), table_after);
+        let after = render_config(&config).expect("after render");
+
+        assert_ne!(
+            normalize_config(&before),
+            normalize_config(&after),
+            "changed plugin value must produce different normalized output"
+        );
     }
 }
