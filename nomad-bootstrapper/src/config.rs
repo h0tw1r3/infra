@@ -106,6 +106,14 @@ pub struct DefaultsConfig {
     /// Default driver plugin installation specs. Each entry is keyed by the
     /// driver name (e.g. "containerd-driver"). A per-node `plugin_install` entry
     /// for the same driver *replaces* the default entirely (no deep merge).
+    ///
+    /// For `tarball` entries the `binary` field is the **archive-internal relative
+    /// path** of the executable (e.g. `"nomad-driver-containerd"` or
+    /// `"linux-amd64/nomad-driver-foo"`). Use version-pinned, immutable URLs;
+    /// mutable "latest" asset URLs defeat idempotency.
+    ///
+    /// For `apt` entries the `binary` field is the **absolute on-disk path** where
+    /// the package installs the executable (e.g. `"/usr/sbin/nomad-driver-lxc"`).
     #[serde(default)]
     pub plugin_install: HashMap<String, PluginInstallConfig>,
 }

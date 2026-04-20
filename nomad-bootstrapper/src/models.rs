@@ -58,21 +58,32 @@ pub struct AdvertiseConfig {
 ///
 /// Each variant describes how to obtain the plugin binary and where it lives
 /// after installation, so the install phase can place it into `plugin_dir`.
+///
+/// ## `binary` field semantics differ by variant
+/// - **`Tarball`**: `binary` is the **exact relative path of the target executable
+///   within the archive** after extraction (e.g. `"nomad-driver-containerd"` or
+///   `"linux-amd64/nomad-driver-foo"`). The binary is moved to
+///   `plugin_dir/<basename(binary)>`.
+/// - **`Apt`**: `binary` is the **absolute on-disk path** where the package
+///   installs the executable (e.g. `"/usr/sbin/nomad-driver-lxc"`). A symlink
+///   `plugin_dir/<basename(binary)>` → `binary` is created or corrected.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "method", rename_all = "lowercase")]
 pub enum PluginInstallConfig {
     /// Download a release tarball and extract a named binary from it.
     ///
     /// `url` may contain `{arch}` which is substituted with the target arch
-    /// (`amd64` or `arm64`) at install time.
-    /// `binary` is the path of the binary *inside* the tarball (can be a bare
-    /// filename or a relative path like `linux-amd64/nomad-driver-foo`).
+    /// (`amd64` or `arm64`) at install time. Use version-pinned, immutable URLs —
+    /// mutable "latest" URLs defeat idempotency.
+    ///
+    /// `binary` is the path of the binary *inside* the tarball after extraction
+    /// (can be a bare filename or a relative path like `linux-amd64/nomad-driver-foo`).
     Tarball { url: String, binary: String },
     /// Install via `apt-get` and symlink the installed binary into `plugin_dir`.
     ///
-    /// `binary` is the *full path* where apt drops the executable
+    /// `binary` is the *full absolute path* where apt drops the executable
     /// (e.g. `/usr/sbin/nomad-driver-lxc`). A symlink
-    /// `plugin_dir/<filename>` → `binary` is created if absent.
+    /// `plugin_dir/<filename>` → `binary` is created or corrected if the target drifts.
     Apt {
         package: String,
         version: Option<String>,
