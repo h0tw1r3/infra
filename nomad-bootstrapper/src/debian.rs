@@ -229,12 +229,27 @@ impl<'a> DebianHost<'a> {
     /// Callers are responsible for rendering and validating content; use
     /// `render_env_content` in the configure module.
     pub fn write_env_file(&self, path: &str, content: &str) -> Result<()> {
-        self.remote.write_file_atomic_privileged(path, content, 0o640)
+        self.remote
+            .write_file_atomic_privileged(path, content, 0o640)
+    }
+
+    /// Loads a kernel module using `modprobe`. Returns an error if the module is unavailable
+    /// on the host kernel, causing the phase to fail fast.
+    pub fn load_kernel_module(&self, module: &str) -> Result<()> {
+        self.remote
+            .run_privileged_checked(&format!("modprobe {}", shell_quote(module)))?;
+        Ok(())
+    }
+
+    /// Applies sysctl settings from `path` (scoped to that file only, not `--system`).
+    pub fn apply_sysctl_file(&self, path: &str) -> Result<()> {
+        self.remote
+            .run_privileged_checked(&format!("sysctl -p {}", shell_quote(path)))?;
+        Ok(())
     }
 
     /// Writes a privileged config file at `path` (mode 0o640, root-owned).
     /// For configs that support validation, prefer [`write_config_validated`].
-    #[allow(dead_code)]
     pub fn write_config(&self, path: &str, content: &str) -> Result<()> {
         self.remote
             .write_file_atomic_privileged(path, content, 0o640)

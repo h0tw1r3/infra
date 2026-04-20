@@ -236,6 +236,7 @@ mod tests {
                     name: "node-1".to_string(),
                     datacenter: "dc1".to_string(),
                     version: "latest".to_string(),
+                    cni_version: "v1.6.2".to_string(),
                     roles: vec![NodeRole::Server],
                     server_config: Some(ServerConfig {
                         bootstrap_expect: 1,
@@ -262,6 +263,7 @@ mod tests {
                     name: "node-2".to_string(),
                     datacenter: "dc1".to_string(),
                     version: "latest".to_string(),
+                    cni_version: "v1.6.2".to_string(),
                     roles: vec![NodeRole::Server],
                     server_config: Some(ServerConfig {
                         bootstrap_expect: 1,

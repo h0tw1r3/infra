@@ -4,7 +4,6 @@ use std::fmt;
 use anyhow::Result;
 use serde::Deserialize;
 
-
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeRole {
@@ -65,11 +64,16 @@ pub struct AdvertiseConfig {
 /// `Inventory::resolve_node` is the canonical constructor, and renderer/test
 /// fixtures should preserve this invariant because configuration rendering
 /// branches on `roles` and then reads the matching role-specific payload.
+///
+/// `cni_version` is structurally present for all nodes but only consumed
+/// when the node has the `client` role. Server-only nodes carry the field
+/// but it has no operational effect.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeConfig {
     pub name: String,
     pub datacenter: String,
     pub version: String,
+    pub cni_version: String,
     pub roles: Vec<NodeRole>,
     pub server_config: Option<ServerConfig>,
     pub client_config: Option<ClientConfig>,
@@ -188,6 +192,7 @@ mod tests {
             name: "node-1".to_string(),
             datacenter: "dc1".to_string(),
             version: "latest".to_string(),
+            cni_version: "v1.6.2".to_string(),
             roles: vec![NodeRole::Server, NodeRole::Client],
             server_config: Some(ServerConfig {
                 bootstrap_expect: 1,

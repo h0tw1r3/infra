@@ -94,6 +94,7 @@ impl Default for ClusterConfig {
 pub struct DefaultsConfig {
     pub nomad_version: Option<String>,
     pub high_latency: Option<bool>,
+    pub cni_version: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -174,6 +175,7 @@ pub struct NodeInventory {
     pub server_address: Vec<String>,
     pub nomad_version: Option<String>,
     pub high_latency: Option<bool>,
+    pub cni_version: Option<String>,
     pub datacenter: Option<String>,
     pub bind_addr: Option<String>,
     #[serde(default)]
@@ -259,6 +261,13 @@ impl Inventory {
             .clone()
             .or_else(|| self.defaults.nomad_version.clone())
             .unwrap_or_else(|| "latest".to_string());
+        // CNI version: node-level override → cluster defaults → pinned known-good version.
+        // Structurally present for all nodes; only consumed when the node has the client role.
+        let cni_version = node
+            .cni_version
+            .clone()
+            .or_else(|| self.defaults.cni_version.clone())
+            .unwrap_or_else(|| "v1.6.2".to_string());
         let roles = validate_roles(&node.roles, name)?;
         let latency_profile = if node
             .high_latency
@@ -322,6 +331,7 @@ impl Inventory {
             name: name.to_string(),
             datacenter,
             version,
+            cni_version,
             roles,
             server_config,
             client_config,
@@ -862,7 +872,11 @@ mod tests {
 
         let nodes = inventory.resolve_nodes().expect("nodes resolve");
         assert_eq!(
-            nodes[0].config.client_config().expect("client config").server_addresses,
+            nodes[0]
+                .config
+                .client_config()
+                .expect("client config")
+                .server_addresses,
             vec!["10.0.1.1:4647".to_string()]
         );
     }
@@ -939,5 +953,81 @@ mod tests {
         assert_eq!(env.get("SHARED").map(String::as_str), Some("node"));
         assert_eq!(env.get("CLUSTER_ONLY").map(String::as_str), Some("yes"));
         assert_eq!(env.get("NODE_ONLY").map(String::as_str), Some("yes"));
+    }
+
+    #[test]
+    fn test_cni_version_falls_back_to_default_when_absent() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "client-1"
+            host = "client-1.example.com"
+            roles = ["client"]
+            server_address = ["10.0.1.1:4647"]
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        assert_eq!(nodes[0].config.cni_version, "v1.6.2");
+    }
+
+    #[test]
+    fn test_cni_version_inherits_from_defaults() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [defaults]
+            cni_version = "v1.5.0"
+
+            [[nodes]]
+            name = "client-1"
+            host = "client-1.example.com"
+            roles = ["client"]
+            server_address = ["10.0.1.1:4647"]
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        assert_eq!(nodes[0].config.cni_version, "v1.5.0");
+    }
+
+    #[test]
+    fn test_cni_version_node_override_takes_precedence() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [defaults]
+            cni_version = "v1.5.0"
+
+            [[nodes]]
+            name = "client-1"
+            host = "client-1.example.com"
+            roles = ["client"]
+            server_address = ["10.0.1.1:4647"]
+            cni_version = "v1.4.0"
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        assert_eq!(nodes[0].config.cni_version, "v1.4.0");
+    }
+
+    #[test]
+    fn test_cni_version_present_on_server_only_node_with_default() {
+        // cni_version is structurally present for all nodes; only consumed for client role.
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            roles = ["server"]
+            bootstrap_expect = 1
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        assert_eq!(nodes[0].config.cni_version, "v1.6.2");
     }
 }

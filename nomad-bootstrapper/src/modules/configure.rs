@@ -16,6 +16,16 @@ const NOMAD_ENV_PATH: &str = "/etc/nomad.d/nomad.env";
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0";
 const DEFAULT_ADVERTISE_ADDR: &str = "{{ GetInterfaceIP \"default\" }}";
 
+/// Kernel module persistence file managed by this bootstrapper.
+const MODULES_LOAD_PATH: &str = "/etc/modules-load.d/nomad-br_netfilter.conf";
+const MODULES_LOAD_CONTENT: &str = "br_netfilter\n";
+
+/// Sysctl bridge settings file managed by this bootstrapper.
+const SYSCTL_BRIDGE_PATH: &str = "/etc/sysctl.d/nomad-bridge.conf";
+const SYSCTL_BRIDGE_CONTENT: &str = "net.bridge.bridge-nf-call-iptables = 1\n\
+    net.bridge.bridge-nf-call-ip6tables = 1\n\
+    net.bridge.bridge-nf-call-arptables = 1\n";
+
 impl PhaseExecutor for Configure {
     fn execute(
         &self,
@@ -41,10 +51,16 @@ impl PhaseExecutor for Configure {
             .map(|current| current != desired_env)
             .unwrap_or(true);
 
-        if !hcl_changed && !env_changed {
+        let cni_changed = if config.has_role(NodeRole::Client) {
+            ensure_br_netfilter(host)?
+        } else {
+            false
+        };
+
+        if !hcl_changed && !env_changed && !cni_changed {
             return Ok(PhaseResult::unchanged(
                 self.name(),
-                "nomad.hcl and nomad.env already match desired state",
+                "nomad.hcl, nomad.env, and bridge networking already match desired state",
             ));
         }
 
@@ -60,16 +76,25 @@ impl PhaseExecutor for Configure {
             host.write_env_file(NOMAD_ENV_PATH, &desired_env)?;
         }
 
-        ctx.mark_restart_required();
+        if hcl_changed || env_changed {
+            ctx.mark_restart_required();
+        }
 
-        let msg = match (hcl_changed, env_changed) {
-            (true, true) => "wrote nomad.hcl and nomad.env, flagged service restart",
-            (true, false) => "wrote nomad.hcl, flagged service restart",
-            (false, true) => "wrote nomad.env, flagged service restart",
-            (false, false) => unreachable!(),
-        };
+        let mut parts = Vec::new();
+        match (hcl_changed, env_changed) {
+            (true, true) => parts.push("wrote nomad.hcl and nomad.env".to_string()),
+            (true, false) => parts.push("wrote nomad.hcl".to_string()),
+            (false, true) => parts.push("wrote nomad.env".to_string()),
+            _ => {}
+        }
+        if hcl_changed || env_changed {
+            parts.push("flagged service restart".to_string());
+        }
+        if cni_changed {
+            parts.push("applied bridge networking settings".to_string());
+        }
 
-        Ok(PhaseResult::changed(self.name(), msg))
+        Ok(PhaseResult::changed(self.name(), parts.join(", ")))
     }
 
     fn name(&self) -> &'static str {
@@ -281,6 +306,46 @@ fn render_hcl_string(value: &str) -> String {
     format!("\"{}\"", escaped)
 }
 
+/// Ensures `br_netfilter` is loaded and the sysctl bridge settings are in place.
+///
+/// Steps (ordered; each is idempotent):
+/// 1. `modprobe br_netfilter` — fail immediately if the kernel module is unavailable.
+/// 2. Persist the module via `/etc/modules-load.d/nomad-br_netfilter.conf` (loaded on boot).
+/// 3. Write `/etc/sysctl.d/nomad-bridge.conf` with the three `net.bridge.*` settings if
+///    the file content differs from the desired state.
+/// 4. If the sysctl file was (re)written, apply it with `sysctl -p` scoped to that file.
+///
+/// Returns `true` if any persistent files were written.
+fn ensure_br_netfilter(host: &DebianHost<'_>) -> Result<bool> {
+    // Always load the module immediately; bail if the kernel does not support it.
+    host.load_kernel_module("br_netfilter")?;
+
+    // Persist the module name so systemd-modules-load loads it automatically on boot.
+    let module_file_changed = host
+        .read_privileged_file(MODULES_LOAD_PATH)?
+        .as_deref()
+        .map(|current| current != MODULES_LOAD_CONTENT)
+        .unwrap_or(true);
+
+    if module_file_changed {
+        host.write_config(MODULES_LOAD_PATH, MODULES_LOAD_CONTENT)?;
+    }
+
+    // Write and optionally apply the bridge sysctl settings.
+    let sysctl_file_changed = host
+        .read_privileged_file(SYSCTL_BRIDGE_PATH)?
+        .as_deref()
+        .map(|current| normalize_config(current) != normalize_config(SYSCTL_BRIDGE_CONTENT))
+        .unwrap_or(true);
+
+    if sysctl_file_changed {
+        host.write_config(SYSCTL_BRIDGE_PATH, SYSCTL_BRIDGE_CONTENT)?;
+        host.apply_sysctl_file(SYSCTL_BRIDGE_PATH)?;
+    }
+
+    Ok(module_file_changed || sysctl_file_changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +356,7 @@ mod tests {
             name: "server-1".to_string(),
             datacenter: "homelab".to_string(),
             version: "1.7.6".to_string(),
+            cni_version: "v1.6.2".to_string(),
             roles: vec![NodeRole::Server],
             server_config: Some(ServerConfig {
                 bootstrap_expect: 3,
@@ -309,6 +375,7 @@ mod tests {
             name: "client-1".to_string(),
             datacenter: "homelab".to_string(),
             version: "1.7.6".to_string(),
+            cni_version: "v1.6.2".to_string(),
             roles: vec![NodeRole::Client],
             server_config: None,
             client_config: Some(ClientConfig {
@@ -573,7 +640,10 @@ mod tests {
     #[test]
     fn test_render_env_content_escapes_backslash_and_double_quote() {
         let mut vars = HashMap::new();
-        vars.insert("KEY".to_string(), r#"has "quotes" and \slashes\"#.to_string());
+        vars.insert(
+            "KEY".to_string(),
+            r#"has "quotes" and \slashes\"#.to_string(),
+        );
         let content = render_env_content(&vars).expect("render");
         assert!(content.contains(r#"KEY="has \"quotes\" and \\slashes\\""#));
     }
@@ -599,7 +669,9 @@ mod tests {
         let mut vars = HashMap::new();
         vars.insert("1INVALID".to_string(), "value".to_string());
         let err = render_env_content(&vars).expect_err("should reject invalid key");
-        assert!(err.to_string().contains("invalid environment variable name"));
+        assert!(err
+            .to_string()
+            .contains("invalid environment variable name"));
     }
 
     #[test]
@@ -607,7 +679,9 @@ mod tests {
         let mut vars = HashMap::new();
         vars.insert("INVALID-KEY".to_string(), "value".to_string());
         let err = render_env_content(&vars).expect_err("should reject hyphenated key");
-        assert!(err.to_string().contains("invalid environment variable name"));
+        assert!(err
+            .to_string()
+            .contains("invalid environment variable name"));
     }
 
     #[test]
@@ -616,5 +690,238 @@ mod tests {
         vars.insert("_PRIVATE".to_string(), "ok".to_string());
         let content = render_env_content(&vars).expect("underscore prefix is valid");
         assert_eq!(content, "_PRIVATE=\"ok\"\n");
+    }
+
+    // ── ensure_br_netfilter ───────────────────────────────────────────────────
+
+    use crate::debian::DebianHost;
+    use crate::test_helpers::{recording_target, RecordingTransport};
+    use crate::transport::{RemoteHost, RemoteOutput};
+
+    /// Recording responses for a successful `modprobe br_netfilter` call (uid=0).
+    fn modprobe_ok_responses() -> Vec<RemoteOutput> {
+        vec![
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        ]
+    }
+
+    #[test]
+    fn test_ensure_br_netfilter_writes_both_files_when_absent() {
+        let mut responses = modprobe_ok_responses();
+        responses.extend([
+            // id -u + read modules-load file → absent
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            // id -u + write modules-load file
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            // id -u + read sysctl file → absent
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            // id -u + write sysctl file
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            // id -u + sysctl -p
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        ]);
+
+        let transport = RecordingTransport::new(responses);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+
+        let changed = ensure_br_netfilter(&host).expect("ensure_br_netfilter succeeds");
+        assert!(changed);
+
+        let commands = transport.commands.lock().expect("commands lock");
+        assert!(commands.iter().any(|c| c.contains("modprobe br_netfilter")));
+        assert!(commands
+            .iter()
+            .any(|c| c.contains("nomad-br_netfilter.conf")));
+        assert!(commands
+            .iter()
+            .any(|c| c.contains("nomad-bridge.conf") && c.contains("cat >")));
+        assert!(commands
+            .iter()
+            .any(|c| c.contains("sysctl -p") && c.contains("nomad-bridge.conf")));
+    }
+
+    #[test]
+    fn test_ensure_br_netfilter_skips_writes_when_already_configured() {
+        let mut responses = modprobe_ok_responses();
+        responses.extend([
+            // id -u + read modules-load file → matches
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: "br_netfilter\n".to_string(),
+                stderr: String::new(),
+            },
+            // id -u + read sysctl file → matches
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: "net.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.bridge.bridge-nf-call-arptables = 1\n".to_string(),
+                stderr: String::new(),
+            },
+        ]);
+
+        let transport = RecordingTransport::new(responses);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+
+        let changed = ensure_br_netfilter(&host).expect("ensure_br_netfilter succeeds");
+        assert!(!changed);
+
+        let commands = transport.commands.lock().expect("commands lock");
+        // modprobe still runs (load on every run), but no file writes and no sysctl -p
+        assert!(commands.iter().any(|c| c.contains("modprobe")));
+        assert!(!commands.iter().any(|c| c.contains("sysctl -p")));
+        assert!(!commands
+            .iter()
+            .any(|c| c.contains("mv") && c.contains("nomad-bridge")));
+    }
+
+    #[test]
+    fn test_ensure_br_netfilter_fails_when_modprobe_fails() {
+        let transport = RecordingTransport::new(vec![
+            // id -u
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            // modprobe → fails
+            RemoteOutput {
+                status: 1,
+                stdout: String::new(),
+                stderr: "modprobe: FATAL: Module br_netfilter not found".to_string(),
+            },
+        ]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+
+        let err = ensure_br_netfilter(&host).expect_err("should fail if modprobe fails");
+        assert!(err.to_string().contains("command failed"));
+    }
+
+    #[test]
+    fn test_ensure_br_netfilter_rewrites_sysctl_when_content_differs() {
+        let mut responses = modprobe_ok_responses();
+        responses.extend([
+            // id -u + read modules-load file → matches
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: "br_netfilter\n".to_string(),
+                stderr: String::new(),
+            },
+            // id -u + read sysctl file → stale content
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: "net.bridge.bridge-nf-call-iptables = 0\n".to_string(),
+                stderr: String::new(),
+            },
+            // id -u + write sysctl
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            // id -u + sysctl -p
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        ]);
+
+        let transport = RecordingTransport::new(responses);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+
+        let changed = ensure_br_netfilter(&host).expect("ensure_br_netfilter succeeds");
+        assert!(changed);
+
+        let commands = transport.commands.lock().expect("commands lock");
+        assert!(commands
+            .iter()
+            .any(|c| c.contains("sysctl -p") && c.contains("nomad-bridge.conf")));
     }
 }
