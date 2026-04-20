@@ -5,7 +5,6 @@ use crate::executor::PhaseExecutor;
 use crate::models::{
     ClientConfig, ExecutionContext, LatencyProfile, NodeConfig, NodeRole, PhaseResult, ServerConfig,
 };
-use crate::state::config_hash;
 
 pub struct Configure;
 
@@ -30,7 +29,6 @@ impl PhaseExecutor for Configure {
             .unwrap_or(false);
 
         if matches {
-            ctx.state.update_config_hash(&config_hash(&desired_config));
             return Ok(PhaseResult::unchanged(
                 self.name(),
                 "nomad configuration already matches desired state",
@@ -42,7 +40,6 @@ impl PhaseExecutor for Configure {
             &desired_config,
             "nomad agent -validate -config \"$tmp\"",
         )?;
-        ctx.state.update_config_hash(&config_hash(&desired_config));
         ctx.mark_restart_required();
 
         Ok(PhaseResult::changed(

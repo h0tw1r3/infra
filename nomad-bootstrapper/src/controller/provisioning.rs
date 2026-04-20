@@ -10,7 +10,6 @@ use crate::config::ExecutionConfig;
 use crate::debian::DebianHost;
 use crate::executor::PhaseExecutor;
 use crate::models::{ExecutionContext, ResolvedNode};
-use crate::state::ProvisionedState;
 use crate::transport::{RemoteHost, Transport};
 
 pub(super) fn run(
@@ -105,7 +104,6 @@ fn run_host(
     let host = DebianHost::new(remote);
 
     let mut ctx = ExecutionContext::default();
-    ctx.state = ProvisionedState::load_optional(host.remote());
 
     let mut last_completed_phase = None;
     for (index, phase) in phases.iter().enumerate() {
@@ -149,7 +147,6 @@ fn run_host(
         }
     }
 
-    ctx.state.save_optional(host.remote());
     info!("Completed host: {}", host.remote().label());
     HostStatus::ProvisioningSucceeded
 }

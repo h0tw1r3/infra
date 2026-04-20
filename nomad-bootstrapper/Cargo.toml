@@ -20,7 +20,6 @@ env_logger = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 thiserror = "1.0"
-chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.8"
 sudo2 = "0.2"
 shell-escape = "0.1"

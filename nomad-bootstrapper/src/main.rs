@@ -6,7 +6,6 @@ mod debian;
 mod executor;
 mod models;
 mod modules;
-mod state;
 mod transport;
 
 #[cfg(test)]

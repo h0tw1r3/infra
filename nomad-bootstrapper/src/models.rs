@@ -3,7 +3,6 @@ use std::fmt;
 use anyhow::Result;
 use serde::Deserialize;
 
-use crate::state::ProvisionedState;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -136,7 +135,6 @@ pub struct ResolvedNode {
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionContext {
     restart_required: bool,
-    pub state: ProvisionedState,
 }
 
 impl ExecutionContext {

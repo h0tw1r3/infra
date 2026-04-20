@@ -11,21 +11,19 @@ impl PhaseExecutor for Install {
         &self,
         host: &DebianHost<'_>,
         config: &NodeConfig,
-        ctx: &mut ExecutionContext,
+        _ctx: &mut ExecutionContext,
     ) -> Result<PhaseResult> {
         let is_latest = config.version == "latest";
         if is_latest {
-            if let Some(installed_version) = host.installed_package_version("nomad")? {
-                if !host.package_is_upgradable("nomad")? {
-                    ctx.state.update_provision(&installed_version);
-                    return Ok(PhaseResult::unchanged(
-                        self.name(),
-                        "nomad is already at the latest available package version",
-                    ));
-                }
+            if host.installed_package_version("nomad")?.is_some()
+                && !host.package_is_upgradable("nomad")?
+            {
+                return Ok(PhaseResult::unchanged(
+                    self.name(),
+                    "nomad is already at the latest available package version",
+                ));
             }
         } else if host.package_version_satisfies("nomad", &config.version)? {
-            ctx.state.update_provision(&config.version);
             return Ok(PhaseResult::unchanged(
                 self.name(),
                 format!("nomad {} is already installed", config.version),
@@ -38,11 +36,6 @@ impl PhaseExecutor for Install {
             format!("nomad={}", config.version)
         };
         host.apt_install(std::slice::from_ref(&package_spec))?;
-
-        let provisioned_version = host
-            .installed_package_version("nomad")?
-            .unwrap_or_else(|| config.version.clone());
-        ctx.state.update_provision(&provisioned_version);
 
         Ok(PhaseResult::changed(
             self.name(),
@@ -107,7 +100,6 @@ mod tests {
         assert!(result
             .message
             .contains("already at the latest available package version"));
-        assert_eq!(ctx.state.provisioned_version.as_deref(), Some("1.8.0-1"));
 
         let commands = transport.commands.lock().expect("commands lock");
         assert_eq!(
@@ -147,12 +139,6 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
             },
-            // installed_package_version post-install → "1.8.0-1"
-            RemoteOutput {
-                status: 0,
-                stdout: "1.8.0-1\n".to_string(),
-                stderr: String::new(),
-            },
         ]);
         let target = recording_target();
         let host = DebianHost::new(RemoteHost::new(&transport, &target));
@@ -164,7 +150,6 @@ mod tests {
 
         assert!(result.changes_made);
         assert_eq!(result.message, "installed nomad");
-        assert_eq!(ctx.state.provisioned_version.as_deref(), Some("1.8.0-1"));
 
         let commands = transport.commands.lock().expect("commands lock");
         assert_eq!(
@@ -174,10 +159,6 @@ mod tests {
         assert_eq!(commands[1], "apt-cache policy nomad");
         assert_eq!(commands[2], "id -u");
         assert_eq!(commands[3], "apt-get install -y -qq nomad");
-        assert_eq!(
-            commands[4],
-            "if dpkg -s nomad >/dev/null 2>&1; then dpkg-query -W -f='${Version}' nomad; fi"
-        );
     }
 
     #[test]
@@ -198,11 +179,6 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
             },
-            RemoteOutput {
-                status: 0,
-                stdout: "1.8.0-1\n".to_string(),
-                stderr: String::new(),
-            },
         ]);
         let target = recording_target();
         let host = DebianHost::new(RemoteHost::new(&transport, &target));
@@ -214,7 +190,6 @@ mod tests {
 
         assert!(result.changes_made);
         assert_eq!(result.message, "installed nomad");
-        assert_eq!(ctx.state.provisioned_version.as_deref(), Some("1.8.0-1"));
 
         let commands = transport.commands.lock().expect("commands lock");
         assert_eq!(
@@ -223,9 +198,5 @@ mod tests {
         );
         assert_eq!(commands[1], "id -u");
         assert_eq!(commands[2], "apt-get install -y -qq nomad");
-        assert_eq!(
-            commands[3],
-            "if dpkg -s nomad >/dev/null 2>&1; then dpkg-query -W -f='${Version}' nomad; fi"
-        );
     }
 }
