@@ -508,7 +508,7 @@ mod tests {
         host.write_config_validated(
             "/etc/nomad.d/nomad.hcl",
             "name = \"test\"\n",
-            "nomad agent -validate -config \"$tmp\"",
+            "nomad config validate \"$tmp\"",
         )
         .expect("write succeeds");
 
@@ -517,7 +517,7 @@ mod tests {
         assert_eq!(commands[0], "id -u");
         let script = &commands[1];
         assert!(
-            script.contains("nomad agent -validate -config \"$tmp\""),
+            script.contains("nomad config validate \"$tmp\""),
             "validate_cmd must appear in the shell script: {}",
             script
         );
@@ -527,7 +527,7 @@ mod tests {
             script
         );
         let validate_pos = script
-            .find("nomad agent -validate")
+            .find("nomad config validate")
             .expect("validate present");
         let mv_pos = script.find("mv \"$tmp\"").expect("mv present");
         assert!(validate_pos < mv_pos, "validate must precede mv");

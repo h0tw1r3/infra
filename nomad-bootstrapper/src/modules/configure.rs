@@ -70,7 +70,7 @@ impl PhaseExecutor for Configure {
             host.write_config_validated(
                 NOMAD_CONFIG_PATH,
                 &desired_hcl,
-                "nomad agent -validate -config \"$tmp\"",
+                "nomad config validate \"$tmp\"",
             )?;
         }
 
