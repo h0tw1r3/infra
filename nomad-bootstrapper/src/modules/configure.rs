@@ -197,7 +197,12 @@ fn render_config(config: &NodeConfig) -> Result<String> {
             lines.extend(render_plugin_blocks(&config.plugins)?);
         }
     } else if !config.plugins.is_empty() {
-        // Non-client nodes cannot use plugin config; warn and skip rendering.
+        // Intentional design: plugin config is only meaningful on client nodes.
+        // Non-client nodes skip rendering entirely and emit a named warning so
+        // operators can identify and fix inventory misconfigurations. This means
+        // invalid plugin keys on non-client nodes produce a warning rather than
+        // an error, because rendering (and therefore key validation) is never
+        // reached. This asymmetry is expected behaviour.
         let plugin_names: Vec<&str> = {
             let mut names: Vec<&str> = config.plugins.keys().map(String::as_str).collect();
             names.sort_unstable();
@@ -334,6 +339,9 @@ fn render_hcl_string(value: &str) -> String {
 ///   }
 /// }
 /// ```
+///
+/// Plugins with an empty merged config table are skipped entirely — Nomad
+/// does not require an explicit config block and empty `config {}` adds noise.
 fn render_plugin_blocks(plugins: &HashMap<String, toml::Table>) -> Result<Vec<String>> {
     let mut plugin_names: Vec<&str> = plugins.keys().map(String::as_str).collect();
     plugin_names.sort_unstable();
@@ -341,6 +349,10 @@ fn render_plugin_blocks(plugins: &HashMap<String, toml::Table>) -> Result<Vec<St
     let mut lines = Vec::new();
     for name in plugin_names {
         let table = &plugins[name];
+        // Skip plugins whose merged config is empty; no stanza needed.
+        if table.is_empty() {
+            continue;
+        }
         lines.push(String::new());
         lines.push(format!("plugin {} {{", render_hcl_string(name)));
         lines.push("  config {".to_string());
@@ -358,6 +370,10 @@ fn render_plugin_blocks(plugins: &HashMap<String, toml::Table>) -> Result<Vec<St
 /// Keys within a table are sorted alphabetically at every level for deterministic
 /// output. Nested tables become HCL block syntax. Arrays must contain only scalar
 /// values; arrays containing tables or mixed types return an error.
+///
+/// All keys are validated as HCL bare identifiers via [`render_hcl_key`]; keys
+/// containing characters that are invalid in unquoted HCL attribute names return
+/// an error rather than emitting potentially invalid config.
 fn render_plugin_table(table: &toml::Table, indent: usize) -> Result<Vec<String>> {
     let prefix = " ".repeat(indent);
     let mut keys: Vec<&str> = table.keys().map(String::as_str).collect();
@@ -365,10 +381,13 @@ fn render_plugin_table(table: &toml::Table, indent: usize) -> Result<Vec<String>
 
     let mut lines = Vec::new();
     for key in keys {
+        // Validate key before branching so the rule applies to both block
+        // labels (foo { }) and assignment keys (foo = ...).
+        let validated_key = render_hcl_key(key)?;
         let val = &table[key];
         match val {
             toml::Value::Table(inner) => {
-                lines.push(format!("{}{} {{", prefix, key));
+                lines.push(format!("{}{} {{", prefix, validated_key));
                 for line in render_plugin_table(inner, indent + 2)? {
                     lines.push(line);
                 }
@@ -376,11 +395,11 @@ fn render_plugin_table(table: &toml::Table, indent: usize) -> Result<Vec<String>
             }
             toml::Value::Array(arr) => {
                 let rendered = render_plugin_array(arr, key)?;
-                lines.push(format!("{}{} = {}", prefix, key, rendered));
+                lines.push(format!("{}{} = {}", prefix, validated_key, rendered));
             }
             scalar => {
                 let rendered = render_plugin_scalar(scalar, key)?;
-                lines.push(format!("{}{} = {}", prefix, key, rendered));
+                lines.push(format!("{}{} = {}", prefix, validated_key, rendered));
             }
         }
     }
@@ -418,11 +437,24 @@ fn render_plugin_array(arr: &[toml::Value], key: &str) -> Result<String> {
 }
 
 /// Renders a single TOML scalar value to its HCL representation.
+///
+/// Floats use Rust's default `f64` Display, which produces stable human-readable
+/// output (e.g. `1`, `0.5`, `1e10`). Non-finite values (`NaN`, `inf`, `-inf`)
+/// are not valid HCL numeric literals and are rejected with an error.
 fn render_plugin_scalar(val: &toml::Value, key: &str) -> Result<String> {
     match val {
         toml::Value::Boolean(b) => Ok(b.to_string()),
         toml::Value::Integer(i) => Ok(i.to_string()),
-        toml::Value::Float(f) => Ok(f.to_string()),
+        toml::Value::Float(f) => {
+            if !f.is_finite() {
+                anyhow::bail!(
+                    "plugin config key '{}': non-finite float values (NaN, inf) \
+                     are not valid HCL literals",
+                    key
+                );
+            }
+            Ok(f.to_string())
+        }
         toml::Value::String(s) => Ok(render_hcl_string(s)),
         toml::Value::Datetime(dt) => Ok(render_hcl_string(&dt.to_string())),
         toml::Value::Table(_) | toml::Value::Array(_) => {
@@ -431,6 +463,34 @@ fn render_plugin_scalar(val: &toml::Value, key: &str) -> Result<String> {
                 key
             );
         }
+    }
+}
+
+/// Validates and returns `key` as a bare HCL attribute name.
+///
+/// HCL bare identifiers must match `[a-zA-Z_][a-zA-Z0-9_-]*`. Keys that do not
+/// conform are rejected with an error rather than being silently quoted, because
+/// Nomad's HCL parser only accepts bare attribute names in configuration body
+/// context, and a quoted name that Nomad won't accept would be misleading.
+///
+/// Valid: `allow_privileged`, `max-files`, `_internal`
+/// Invalid: `allow.privileged`, `3count`, `key with spaces`
+fn render_hcl_key(key: &str) -> Result<&str> {
+    let mut chars = key.chars();
+    let valid = match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(key)
+    } else {
+        anyhow::bail!(
+            "plugin config key '{}' is not a valid HCL identifier; \
+             keys must match [a-zA-Z_][a-zA-Z0-9_-]*",
+            key
+        )
     }
 }
 
@@ -1194,6 +1254,136 @@ mod tests {
     }
 
     // ── Role gating tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_render_hcl_key_accepts_valid_identifiers() {
+        assert_eq!(render_hcl_key("enabled").unwrap(), "enabled");
+        assert_eq!(
+            render_hcl_key("allow_privileged").unwrap(),
+            "allow_privileged"
+        );
+        assert_eq!(render_hcl_key("max-files").unwrap(), "max-files");
+        assert_eq!(render_hcl_key("_internal").unwrap(), "_internal");
+        assert_eq!(render_hcl_key("key123").unwrap(), "key123");
+    }
+
+    #[test]
+    fn test_render_hcl_key_rejects_invalid_identifiers() {
+        // Starts with digit
+        assert!(render_hcl_key("3count").is_err());
+        // Contains dot
+        assert!(render_hcl_key("allow.privileged").is_err());
+        // Contains space
+        assert!(render_hcl_key("key with spaces").is_err());
+        // Empty string
+        assert!(render_hcl_key("").is_err());
+    }
+
+    #[test]
+    fn test_render_plugin_blocks_invalid_key_returns_error() {
+        // End-to-end: invalid key in plugin table must bubble up as an error.
+        let table = make_plugin_table(&[("allow.privileged", toml::Value::Boolean(false))]);
+        let mut plugins = HashMap::new();
+        plugins.insert("docker".to_string(), table);
+
+        let err = render_plugin_blocks(&plugins).expect_err("invalid key must fail");
+        assert!(
+            err.to_string().contains("not a valid HCL identifier"),
+            "error must explain key validation: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_render_plugin_blocks_empty_table_is_skipped() {
+        // A plugin with an empty merged config produces no stanza.
+        let mut plugins = HashMap::new();
+        plugins.insert("raw_exec".to_string(), toml::Table::new());
+
+        let lines = render_plugin_blocks(&plugins).expect("render succeeds");
+        assert!(
+            lines.is_empty(),
+            "empty plugin config table must produce no output lines"
+        );
+    }
+
+    #[test]
+    fn test_render_plugin_blocks_mixed_empty_and_nonempty() {
+        // Only the non-empty plugin renders; the empty one is silently skipped.
+        let mut plugins = HashMap::new();
+        plugins.insert("raw_exec".to_string(), toml::Table::new());
+        plugins.insert(
+            "docker".to_string(),
+            make_plugin_table(&[("enabled", toml::Value::Boolean(true))]),
+        );
+
+        let output = render_plugin_blocks(&plugins)
+            .expect("render succeeds")
+            .join("\n");
+
+        assert!(output.contains("plugin \"docker\""), "docker must render");
+        assert!(
+            !output.contains("plugin \"raw_exec\""),
+            "empty raw_exec must be skipped"
+        );
+    }
+
+    #[test]
+    fn test_render_plugin_scalar_rejects_nan() {
+        let err = render_plugin_scalar(&toml::Value::Float(f64::NAN), "timeout")
+            .expect_err("NaN must fail");
+        assert!(err.to_string().contains("non-finite float"), "{}", err);
+    }
+
+    #[test]
+    fn test_render_plugin_scalar_rejects_inf() {
+        let err = render_plugin_scalar(&toml::Value::Float(f64::INFINITY), "ratio")
+            .expect_err("inf must fail");
+        assert!(err.to_string().contains("non-finite float"), "{}", err);
+    }
+
+    #[test]
+    fn test_render_plugin_scalar_finite_float_renders() {
+        assert_eq!(
+            render_plugin_scalar(&toml::Value::Float(1.5), "ratio").unwrap(),
+            "1.5"
+        );
+        assert_eq!(
+            render_plugin_scalar(&toml::Value::Float(0.0), "ratio").unwrap(),
+            "0"
+        );
+    }
+
+    // Non-client node + invalid key → warning only (rendering skipped, no error).
+    // Client node + invalid key → error from render_plugin_blocks.
+    #[test]
+    fn test_non_client_invalid_key_warns_not_errors() {
+        let table = make_plugin_table(&[("allow.privileged", toml::Value::Boolean(false))]);
+        let mut config = server_node_config();
+        config.plugins.insert("docker".to_string(), table);
+
+        // render_config must succeed even though the key is invalid, because
+        // rendering is never attempted for non-client nodes.
+        let rendered = render_config(&config).expect("server-only node must not error");
+        assert!(
+            !rendered.contains("plugin"),
+            "no plugin stanza must appear for server-only node"
+        );
+    }
+
+    #[test]
+    fn test_client_invalid_key_returns_error() {
+        let table = make_plugin_table(&[("allow.privileged", toml::Value::Boolean(false))]);
+        let mut config = client_node_config();
+        config.plugins.insert("docker".to_string(), table);
+
+        let err = render_config(&config).expect_err("client node with invalid key must fail");
+        assert!(
+            err.to_string().contains("not a valid HCL identifier"),
+            "error must name the invalid key: {}",
+            err
+        );
+    }
 
     #[test]
     fn test_render_config_client_with_plugins_renders_plugin_blocks() {

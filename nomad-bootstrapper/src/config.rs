@@ -396,7 +396,10 @@ fn normalize_escalation(value: Option<Vec<String>>) -> Option<Vec<String>> {
 ///   table beats scalar, scalar beats scalar).
 /// - Keys present only in `base` are inherited unchanged.
 /// - Keys present only in `override_table` are added.
-pub fn deep_merge_plugin_config(base: toml::Table, override_table: toml::Table) -> toml::Table {
+pub(crate) fn deep_merge_plugin_config(
+    base: toml::Table,
+    override_table: toml::Table,
+) -> toml::Table {
     let mut result = base;
     for (key, override_val) in override_table {
         let merged = match (result.remove(&key), override_val) {
