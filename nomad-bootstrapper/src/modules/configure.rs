@@ -265,11 +265,14 @@ fn render_client_block(client: &ClientConfig) -> Vec<String> {
         String::new(),
         "client {".to_string(),
         "  enabled = true".to_string(),
+        "  servers = [".to_string(),
+        servers
+            .lines()
+            .map(|l| format!("  {}", l))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "  ]".to_string(),
         "}".to_string(),
-        String::new(),
-        "servers = [".to_string(),
-        servers,
-        "]".to_string(),
     ]
 }
 
@@ -673,9 +676,17 @@ mod tests {
         let rendered = render_config(&client_node_config()).expect("rendered config");
         assert!(rendered.contains("client {"));
         assert!(rendered.contains("enabled = true"));
-        assert!(rendered.contains("servers = ["));
         assert!(rendered.contains("\"10.0.1.1:4647\""));
         assert!(!rendered.contains("server {"));
+
+        // servers must be nested inside the client block, not at the top level
+        let client_pos = rendered.find("client {").unwrap();
+        let servers_pos = rendered.find("servers = [").unwrap();
+        let close_pos = rendered[client_pos..].find('}').unwrap() + client_pos;
+        assert!(
+            servers_pos > client_pos && servers_pos < close_pos,
+            "servers should be inside client {{ }} block"
+        );
     }
 
     #[test]
