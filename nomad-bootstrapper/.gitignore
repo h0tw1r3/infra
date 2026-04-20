@@ -27,3 +27,4 @@ cobertura.xml
 # Environment
 .env
 .env.local
+inventory.toml
