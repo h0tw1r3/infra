@@ -377,6 +377,11 @@ fn ensure_binary_plugin(
 }
 
 ///
+/// ## Archive format detection
+/// The format is inferred from the resolved URL:
+/// - URLs ending in `.zip` are extracted with `unzip`.
+/// - All other URLs are extracted with `tar -xzf` (handles `.tar.gz`, `.tgz`).
+///
 /// ## Idempotency
 /// A sentinel file `plugin_dir/.installed-<driver_name>` stores two lines:
 /// - line 1: the resolved download URL
@@ -387,14 +392,14 @@ fn ensure_binary_plugin(
 ///
 /// ## `binary` semantics
 /// `binary` must be the **exact relative path of the binary within the archive** after
-/// extraction (e.g. `"nomad-driver-containerd"` or `"linux-amd64/nomad-driver-foo"`).
+/// extraction (e.g. `"nomad-driver-exec2"` or `"linux-amd64/nomad-driver-foo"`).
 /// The binary is moved to `plugin_dir/<basename(binary)>` after extraction.
 ///
 /// Use version-pinned, immutable URLs. Mutable "latest" URLs can cause the sentinel to
 /// match while the underlying content has changed, defeating idempotency.
 ///
 /// ## Atomicity
-/// The tarball is extracted into a temp directory created inside `plugin_dir` (same
+/// The archive is extracted into a temp directory created inside `plugin_dir` (same
 /// filesystem), so the final `mv` into `plugin_dir` is a guaranteed atomic rename.
 ///
 /// Returns `true` if a change was made.
@@ -425,17 +430,25 @@ fn ensure_tarball_plugin(
         return Ok(false);
     }
 
-    // Download tarball to /tmp, extract into a temp dir inside plugin_dir (same FS),
+    let is_zip = url.ends_with(".zip");
+    let tmp_ext = if is_zip { "zip" } else { "tgz" };
+    let extract_cmd = if is_zip {
+        "unzip -o \"$tmp_archive\" -d \"$tmp_dir\"".to_string()
+    } else {
+        "tar -xzf \"$tmp_archive\" -C \"$tmp_dir\"".to_string()
+    };
+
+    // Download archive to /tmp, extract into a temp dir inside plugin_dir (same FS),
     // validate the binary at its configured archive-internal path, chmod +x, then
     // atomically move it into place before writing the sentinel last.
     let install_cmd = format!(
         "set -eu; \
          mkdir -p {plugin_dir_q}; \
-         tmp_tgz=$(mktemp /tmp/plugin-{driver_name_q}.XXXXXX.tgz); \
+         tmp_archive=$(mktemp /tmp/plugin-{driver_name_q}.XXXXXX.{tmp_ext}); \
          tmp_dir=$(mktemp -d {plugin_dir_q}/.plugin-{driver_name_q}.XXXXXX); \
-         trap 'rm -rf \"$tmp_tgz\" \"$tmp_dir\"' EXIT; \
-         curl -fsSL {url_q} -o \"$tmp_tgz\"; \
-         tar -xzf \"$tmp_tgz\" -C \"$tmp_dir\"; \
+         trap 'rm -rf \"$tmp_archive\" \"$tmp_dir\"' EXIT; \
+         curl -fsSL {url_q} -o \"$tmp_archive\"; \
+         {extract_cmd}; \
          extracted=\"$tmp_dir\"/{binary_q}; \
          [ -f \"$extracted\" ] || {{ echo 'ERROR: binary not found at archive path {binary_display}' >&2; exit 1; }}; \
          chmod +x \"$extracted\"; \
@@ -443,7 +456,9 @@ fn ensure_tarball_plugin(
          printf '%s\\n%s' {url_store_q} {binary_store_q} > {sentinel_q}",
         driver_name_q = shell_quote(driver_name),
         plugin_dir_q = shell_quote(plugin_dir),
+        tmp_ext = tmp_ext,
         url_q = shell_quote(url),
+        extract_cmd = extract_cmd,
         binary_q = shell_quote(binary),
         binary_display = binary,
         dest_q = shell_quote(&dest),
@@ -1190,6 +1205,63 @@ mod tests {
         // New flow: extract to temp dir inside plugin_dir, mv binary, then write sentinel.
         assert!(install_cmd.contains("mktemp -d"));
         assert!(install_cmd.contains("mv "));
+    }
+
+    #[test]
+    fn test_zip_plugin_uses_unzip_and_zip_extension() {
+        let mut config = client_node_config();
+        config.plugin_installs.insert(
+            "exec2".to_string(),
+            PluginInstallConfig::Tarball {
+                url: UrlSpec::Single(
+                    "https://releases.hashicorp.com/nomad-driver-exec2/0.1.1/nomad-driver-exec2_0.1.1_linux_amd64.zip"
+                        .to_string(),
+                ),
+                binary: "nomad-driver-exec2".to_string(),
+            },
+        );
+
+        let mut responses = nomad_and_cni_current_responses();
+        responses.extend([
+            // No uname -m needed: no {arch} placeholder.
+            // read sentinel → absent
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            // id -u
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            // install command
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        ]);
+
+        let transport = RecordingTransport::new(responses);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+        let mut ctx = ExecutionContext::default();
+
+        let result = Install
+            .execute(&host, &config, &mut ctx)
+            .expect("install succeeds");
+
+        assert!(result.changes_made);
+        let commands = transport.commands.lock().expect("commands lock");
+        let install_cmd = commands.last().expect("install command present");
+        // Must use unzip, not tar
+        assert!(install_cmd.contains("unzip"));
+        assert!(!install_cmd.contains("tar "));
+        // Temp file must use .zip extension
+        assert!(install_cmd.contains(".zip"));
+        assert!(install_cmd.contains("nomad-driver-exec2_0.1.1_linux_amd64.zip"));
     }
 
     #[test]
