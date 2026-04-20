@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,10 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
 
+    /// Delete unrecognized .hcl files found in /etc/nomad.d instead of failing.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+
     /// Log level (debug, info, warn, error).
     #[arg(long, default_value = "info")]
     pub log_level: String,
@@ -65,6 +70,8 @@ impl Args {
 #[serde(default, deny_unknown_fields)]
 pub struct ClusterConfig {
     pub datacenter: String,
+    #[serde(default)]
+    pub env_vars: HashMap<String, String>,
 }
 
 impl ClusterConfig {
@@ -77,6 +84,7 @@ impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             datacenter: Self::default_datacenter(),
+            env_vars: HashMap::new(),
         }
     }
 }
@@ -172,6 +180,8 @@ pub struct NodeInventory {
     pub advertise: Option<AdvertiseInventory>,
     #[serde(default)]
     pub ssh: Option<SshConfig>,
+    #[serde(default)]
+    pub env_vars: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -274,6 +284,8 @@ impl Inventory {
             .map_err(|err| anyhow::anyhow!("node '{}': {}", name, err))?;
         let bind_addr = normalize_nomad_config_value(node.bind_addr.as_deref(), name, "bind_addr")?;
         let advertise = resolve_advertise(node.advertise.as_ref(), name)?;
+        let mut env_vars = self.cluster.env_vars.clone();
+        env_vars.extend(node.env_vars.clone());
         let server_config = if roles.contains(&NodeRole::Server) {
             let bootstrap_expect = node.bootstrap_expect.ok_or_else(|| {
                 anyhow::anyhow!("node '{}' requires bootstrap_expect for server role", name)
@@ -308,6 +320,7 @@ impl Inventory {
             bind_addr,
             advertise,
             latency_profile,
+            env_vars,
         };
 
         Ok(ResolvedNode {
@@ -694,6 +707,7 @@ mod tests {
             up_to: None,
             preflight_only: true,
             dry_run: false,
+            force: false,
             log_level: "info".to_string(),
         }
         .validated()
@@ -872,5 +886,30 @@ mod tests {
         assert!(err
             .to_string()
             .contains("advertise must set at least one of http, rpc, or serf"));
+    }
+
+    #[test]
+    fn test_env_vars_node_overrides_cluster() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [cluster]
+            env_vars = { SHARED = "cluster", CLUSTER_ONLY = "yes" }
+
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            roles = ["server"]
+            bootstrap_expect = 1
+            env_vars = { SHARED = "node", NODE_ONLY = "yes" }
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("resolve nodes");
+        let env = &nodes[0].config.env_vars;
+
+        assert_eq!(env.get("SHARED").map(String::as_str), Some("node"));
+        assert_eq!(env.get("CLUSTER_ONLY").map(String::as_str), Some("yes"));
+        assert_eq!(env.get("NODE_ONLY").map(String::as_str), Some("yes"));
     }
 }

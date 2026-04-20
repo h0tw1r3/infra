@@ -208,6 +208,34 @@ impl<'a> DebianHost<'a> {
         Ok(())
     }
 
+    /// Lists all `.hcl` files directly inside `dir`.
+    ///
+    /// Returns a sorted list of absolute file paths.
+    pub fn list_hcl_files(&self, dir: &str) -> Result<Vec<String>> {
+        self.remote.list_files_privileged(dir, "*.hcl")
+    }
+
+    /// Removes a privileged file at `path`.
+    pub fn remove_file(&self, path: &str) -> Result<()> {
+        self.remote
+            .run_privileged_checked(&format!("rm -f {}", shell_quote(path)))?;
+        Ok(())
+    }
+
+    /// Writes environment variable pairs to `path` as `KEY=VALUE` lines, sorted by key.
+    ///
+    /// Writes an empty file when `vars` is empty — required to satisfy the systemd
+    /// `EnvironmentFile=` directive used by the Nomad service unit on Debian.
+    pub fn write_env_file(&self, path: &str, vars: &std::collections::HashMap<String, String>) -> Result<()> {
+        let mut keys: Vec<&str> = vars.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let content = keys
+            .iter()
+            .map(|k| format!("{}={}\n", k, vars[*k]))
+            .collect::<String>();
+        self.remote.write_file_atomic_privileged(path, &content, 0o640)
+    }
+
     /// Writes a privileged config file at `path` (mode 0o640, root-owned).
     /// For configs that support validation, prefer [`write_config_validated`].
     #[allow(dead_code)]
@@ -492,5 +520,59 @@ mod tests {
             .expect("validate present");
         let mv_pos = script.find("mv \"$tmp\"").expect("mv present");
         assert!(validate_pos < mv_pos, "validate must precede mv");
+    }
+
+    #[test]
+    fn test_write_env_file_writes_sorted_key_value_pairs() {
+        let transport = RecordingTransport::new(vec![
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        ]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("NOMAD_SKIP_VERIFY".to_string(), "true".to_string());
+        vars.insert("VAULT_ADDR".to_string(), "http://vault:8200".to_string());
+
+        host.write_env_file("/etc/nomad.d/nomad.env", &vars)
+            .expect("env file write");
+
+        let commands = transport.commands.lock().expect("commands lock");
+        assert_eq!(commands[0], "id -u");
+        assert!(commands[1].contains("cat >"), "command should pipe content");
+    }
+
+    #[test]
+    fn test_write_env_file_writes_empty_file_when_no_vars() {
+        let transport = RecordingTransport::new(vec![
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        ]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+
+        host.write_env_file("/etc/nomad.d/nomad.env", &Default::default())
+            .expect("empty env file write succeeds");
+
+        let commands = transport.commands.lock().expect("commands lock");
+        assert_eq!(commands[0], "id -u");
+        assert!(commands[1].contains("cat >"), "command should pipe content");
     }
 }

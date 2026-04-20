@@ -55,7 +55,7 @@ pub fn run(args: &Args) -> Result<()> {
         return Ok(());
     }
 
-    provisioning::run(&nodes, &phases, &transport, execution, statuses)?;
+    provisioning::run(&nodes, &phases, &transport, execution, statuses, args.force)?;
 
     info!("Nomad controller run complete");
     Ok(())
@@ -245,6 +245,7 @@ mod tests {
                     bind_addr: None,
                     advertise: AdvertiseConfig::default(),
                     latency_profile: LatencyProfile::Standard,
+                    env_vars: Default::default(),
                 },
             },
             ResolvedNode {
@@ -270,6 +271,7 @@ mod tests {
                     bind_addr: None,
                     advertise: AdvertiseConfig::default(),
                     latency_profile: LatencyProfile::Standard,
+                    env_vars: Default::default(),
                 },
             },
         ]
@@ -397,7 +399,7 @@ mod tests {
         let statuses =
             preflight::run(&nodes, &phases, &transport, execution).expect("preflight should pass");
         thread::sleep(Duration::from_millis(10));
-        provisioning::run(&nodes, &phases, &transport, execution, statuses)
+        provisioning::run(&nodes, &phases, &transport, execution, statuses, false)
             .expect("provisioning should pass");
 
         let calls = calls.lock().expect("calls lock");

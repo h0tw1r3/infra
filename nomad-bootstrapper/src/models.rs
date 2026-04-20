@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 
 use anyhow::Result;
@@ -75,6 +76,7 @@ pub struct NodeConfig {
     pub bind_addr: Option<String>,
     pub advertise: AdvertiseConfig,
     pub latency_profile: LatencyProfile,
+    pub env_vars: HashMap<String, String>,
 }
 
 impl NodeConfig {
@@ -135,6 +137,7 @@ pub struct ResolvedNode {
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionContext {
     restart_required: bool,
+    pub force: bool,
 }
 
 impl ExecutionContext {
@@ -196,6 +199,7 @@ mod tests {
             bind_addr: None,
             advertise: AdvertiseConfig::default(),
             latency_profile: LatencyProfile::Standard,
+            env_vars: Default::default(),
         }
     }
 

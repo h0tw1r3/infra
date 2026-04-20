@@ -370,6 +370,28 @@ impl<'a> RemoteHost<'a> {
         }
     }
 
+    /// List files matching `name_pattern` directly inside `dir`.
+    ///
+    /// Returns a sorted list of absolute file paths. Requires privilege escalation
+    /// since `/etc/nomad.d` may not be world-readable.
+    pub fn list_files_privileged(&self, dir: &str, name_pattern: &str) -> Result<Vec<String>> {
+        let command = format!(
+            "find {} -maxdepth 1 -name {} -type f",
+            shell_quote(dir),
+            shell_quote(name_pattern),
+        );
+        let output = self.run_privileged_checked(&command)?;
+        let mut paths: Vec<String> = output
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        paths.sort();
+        Ok(paths)
+    }
+
     pub fn read_file_privileged(&self, path: &str) -> Result<Option<String>> {
         let command = format!(
             "if [ -f {} ]; then cat {}; fi",

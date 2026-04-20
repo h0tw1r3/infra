@@ -207,6 +207,7 @@ mod tests {
                     bind_addr: None,
                     advertise: AdvertiseConfig::default(),
                     latency_profile: LatencyProfile::Standard,
+                    env_vars: Default::default(),
                 },
             })
             .collect()

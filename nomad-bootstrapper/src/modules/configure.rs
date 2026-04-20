@@ -1,4 +1,5 @@
 use anyhow::Result;
+use log::warn;
 
 use crate::debian::{normalize_config, DebianHost};
 use crate::executor::PhaseExecutor;
@@ -8,7 +9,9 @@ use crate::models::{
 
 pub struct Configure;
 
+const NOMAD_CONFIG_DIR: &str = "/etc/nomad.d";
 const NOMAD_CONFIG_PATH: &str = "/etc/nomad.d/nomad.hcl";
+const NOMAD_ENV_PATH: &str = "/etc/nomad.d/nomad.env";
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0";
 const DEFAULT_ADVERTISE_ADDR: &str = "{{ GetInterfaceIP \"default\" }}";
 
@@ -19,6 +22,8 @@ impl PhaseExecutor for Configure {
         config: &NodeConfig,
         ctx: &mut ExecutionContext,
     ) -> Result<PhaseResult> {
+        audit_config_dir(host, ctx)?;
+
         let desired_config = render_config(config)?;
         let existing_config = host.read_privileged_file(NOMAD_CONFIG_PATH)?;
 
@@ -29,6 +34,7 @@ impl PhaseExecutor for Configure {
             .unwrap_or(false);
 
         if matches {
+            host.write_env_file(NOMAD_ENV_PATH, &config.env_vars)?;
             return Ok(PhaseResult::unchanged(
                 self.name(),
                 "nomad configuration already matches desired state",
@@ -40,6 +46,7 @@ impl PhaseExecutor for Configure {
             &desired_config,
             "nomad agent -validate -config \"$tmp\"",
         )?;
+        host.write_env_file(NOMAD_ENV_PATH, &config.env_vars)?;
         ctx.mark_restart_required();
 
         Ok(PhaseResult::changed(
@@ -50,6 +57,37 @@ impl PhaseExecutor for Configure {
 
     fn name(&self) -> &'static str {
         "configure"
+    }
+}
+
+/// Checks `/etc/nomad.d` for unrecognized `.hcl` files that Nomad would silently load.
+///
+/// With `--force`, unknown files are deleted with a warning. Without it, the phase
+/// fails with a list of offending paths.
+fn audit_config_dir(host: &DebianHost<'_>, ctx: &ExecutionContext) -> Result<()> {
+    let known: std::collections::HashSet<&str> = [NOMAD_CONFIG_PATH].into();
+    let found = host.list_hcl_files(NOMAD_CONFIG_DIR)?;
+    let unknown: Vec<String> = found
+        .into_iter()
+        .filter(|path| !known.contains(path.as_str()))
+        .collect();
+
+    if unknown.is_empty() {
+        return Ok(());
+    }
+
+    if ctx.force {
+        for path in &unknown {
+            warn!("removing unrecognized config file: {}", path);
+            host.remove_file(path)?;
+        }
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "unrecognized .hcl files found in {}; remove them or re-run with --force to delete automatically:\n  {}",
+            NOMAD_CONFIG_DIR,
+            unknown.join("\n  ")
+        )
     }
 }
 
@@ -209,6 +247,7 @@ mod tests {
             bind_addr: None,
             advertise: AdvertiseConfig::default(),
             latency_profile: LatencyProfile::Standard,
+            env_vars: Default::default(),
         }
     }
 
@@ -225,6 +264,7 @@ mod tests {
             bind_addr: None,
             advertise: AdvertiseConfig::default(),
             latency_profile: LatencyProfile::Standard,
+            env_vars: Default::default(),
         }
     }
 
@@ -362,5 +402,101 @@ mod tests {
         assert!(err
             .to_string()
             .contains("client configuration is not available for roles client"));
+    }
+
+    #[test]
+    fn test_audit_config_dir_passes_when_only_known_files_present() {
+        use crate::debian::DebianHost;
+        use crate::test_helpers::{recording_target, RecordingTransport};
+        use crate::transport::{RemoteHost, RemoteOutput};
+
+        let transport = RecordingTransport::new(vec![
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: "/etc/nomad.d/nomad.hcl\n".to_string(),
+                stderr: String::new(),
+            },
+        ]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+        let ctx = ExecutionContext::default();
+
+        audit_config_dir(&host, &ctx).expect("known file should pass audit");
+    }
+
+    #[test]
+    fn test_audit_config_dir_fails_on_unknown_hcl_file() {
+        use crate::debian::DebianHost;
+        use crate::test_helpers::{recording_target, RecordingTransport};
+        use crate::transport::{RemoteHost, RemoteOutput};
+
+        let transport = RecordingTransport::new(vec![
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            RemoteOutput {
+                status: 0,
+                stdout: "/etc/nomad.d/nomad.hcl\n/etc/nomad.d/extra.hcl\n".to_string(),
+                stderr: String::new(),
+            },
+        ]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+        let ctx = ExecutionContext::default();
+
+        let err = audit_config_dir(&host, &ctx).expect_err("unknown file should fail audit");
+        assert!(err.to_string().contains("unrecognized .hcl files found"));
+        assert!(err.to_string().contains("extra.hcl"));
+    }
+
+    #[test]
+    fn test_audit_config_dir_removes_unknown_file_with_force() {
+        use crate::debian::DebianHost;
+        use crate::test_helpers::{recording_target, RecordingTransport};
+        use crate::transport::{RemoteHost, RemoteOutput};
+
+        let transport = RecordingTransport::new(vec![
+            // id -u for list_files_privileged
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            // find output: known + unknown
+            RemoteOutput {
+                status: 0,
+                stdout: "/etc/nomad.d/nomad.hcl\n/etc/nomad.d/stray.hcl\n".to_string(),
+                stderr: String::new(),
+            },
+            // id -u for remove_file
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            // rm -f
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        ]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+        let mut ctx = ExecutionContext::default();
+        ctx.force = true;
+
+        audit_config_dir(&host, &ctx).expect("force should delete and succeed");
+
+        let commands = transport.commands.lock().expect("commands lock");
+        assert!(commands.iter().any(|c| c.contains("rm -f")));
+        assert!(commands.iter().any(|c| c.contains("stray.hcl")));
     }
 }

@@ -18,6 +18,7 @@ pub(super) fn run(
     transport: &dyn Transport,
     execution: ExecutionConfig,
     initial_statuses: Vec<HostStatus>,
+    force: bool,
 ) -> Result<()> {
     let queue = Arc::new(Mutex::new((0..nodes.len()).collect::<VecDeque<_>>()));
     let statuses = Arc::new(Mutex::new(initial_statuses));
@@ -43,7 +44,7 @@ pub(super) fn run(
                 };
 
                 let node = &nodes[index];
-                let status = run_host(node, phases, transport, &abort_reason);
+                let status = run_host(node, phases, transport, &abort_reason, force);
                 statuses.lock().expect("provisioning results lock")[index] = status;
             });
         }
@@ -80,6 +81,7 @@ fn run_host(
     phases: &[&dyn PhaseExecutor],
     transport: &dyn Transport,
     abort_reason: &Arc<Mutex<Option<RunAbortReason>>>,
+    force: bool,
 ) -> HostStatus {
     if current_abort(abort_reason).is_some() {
         return HostStatus::PreflightPassed;
@@ -104,6 +106,7 @@ fn run_host(
     let host = DebianHost::new(remote);
 
     let mut ctx = ExecutionContext::default();
+    ctx.force = force;
 
     let mut last_completed_phase = None;
     for (index, phase) in phases.iter().enumerate() {
@@ -303,6 +306,7 @@ mod tests {
                     bind_addr: None,
                     advertise: AdvertiseConfig::default(),
                     latency_profile: LatencyProfile::Standard,
+                    env_vars: Default::default(),
                 },
             })
             .collect()
@@ -321,6 +325,7 @@ mod tests {
             },
             ExecutionConfig { concurrency: 1 },
             vec![HostStatus::PreflightPassed; 2],
+            false,
         )
         .expect_err("expected gate invalidation");
 
@@ -343,6 +348,7 @@ mod tests {
             },
             ExecutionConfig { concurrency: 1 },
             vec![HostStatus::PreflightPassed; 2],
+            false,
         )
         .expect_err("expected gate invalidation");
 
@@ -373,6 +379,7 @@ mod tests {
             },
             ExecutionConfig { concurrency: 2 },
             vec![HostStatus::PreflightPassed; 2],
+            false,
         )
         .expect_err("expected provisioning failure");
 
@@ -434,6 +441,7 @@ mod tests {
             },
             ExecutionConfig { concurrency: 1 },
             vec![HostStatus::PreflightPassed; 2],
+            false,
         )
         .expect("serial provisioning should succeed");
 
