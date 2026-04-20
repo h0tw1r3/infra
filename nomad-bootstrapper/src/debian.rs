@@ -209,9 +209,25 @@ impl<'a> DebianHost<'a> {
     }
 
     /// Writes a privileged config file at `path` (mode 0o640, root-owned).
+    /// For configs that support validation, prefer [`write_config_validated`].
+    #[allow(dead_code)]
     pub fn write_config(&self, path: &str, content: &str) -> Result<()> {
         self.remote
             .write_file_atomic_privileged(path, content, 0o640)
+    }
+
+    /// Writes a privileged config file at `path` (mode 0o640, root-owned), running
+    /// `validate_cmd` against the staged temp file before committing. `validate_cmd`
+    /// is a shell fragment where `$tmp` refers to the staged file path. If validation
+    /// fails, the staged file is removed and the destination is left untouched.
+    pub fn write_config_validated(
+        &self,
+        path: &str,
+        content: &str,
+        validate_cmd: &str,
+    ) -> Result<()> {
+        self.remote
+            .write_file_atomic_privileged_validated(path, content, 0o640, validate_cmd)
     }
 
     /// Restarts a systemd service by name.
@@ -429,5 +445,52 @@ mod tests {
         assert!(!host
             .package_version_satisfies("nomad", "latest")
             .expect("version check"));
+    }
+
+    #[test]
+    fn test_write_config_validated_includes_validate_cmd_before_mv() {
+        let transport = RecordingTransport::new(vec![
+            // id -u → 0 (root, bypasses escalation wrapper)
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            // the atomic write+validate+mv command
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        ]);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+
+        host.write_config_validated(
+            "/etc/nomad.d/nomad.hcl",
+            "name = \"test\"\n",
+            "nomad agent -validate -config \"$tmp\"",
+        )
+        .expect("write succeeds");
+
+        let commands = transport.commands.lock().expect("commands lock");
+        // commands[0] = "id -u", commands[1] = the atomic shell script
+        assert_eq!(commands[0], "id -u");
+        let script = &commands[1];
+        assert!(
+            script.contains("nomad agent -validate -config \"$tmp\""),
+            "validate_cmd must appear in the shell script: {}",
+            script
+        );
+        assert!(
+            script.contains("mv \"$tmp\""),
+            "mv must follow validation: {}",
+            script
+        );
+        let validate_pos = script
+            .find("nomad agent -validate")
+            .expect("validate present");
+        let mv_pos = script.find("mv \"$tmp\"").expect("mv present");
+        assert!(validate_pos < mv_pos, "validate must precede mv");
     }
 }

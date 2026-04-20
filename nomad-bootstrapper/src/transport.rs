@@ -399,6 +399,32 @@ impl<'a> RemoteHost<'a> {
         Ok(())
     }
 
+    /// Like [`write_file_atomic_privileged`] but runs `validate_cmd` against the staged
+    /// temp file before committing. `validate_cmd` is a shell fragment where `$tmp` holds
+    /// the path to the staged file. If validation fails, the temp file is removed and an
+    /// error is returned, leaving the destination file untouched.
+    pub fn write_file_atomic_privileged_validated(
+        &self,
+        path: &str,
+        content: &str,
+        mode: u32,
+        validate_cmd: &str,
+    ) -> Result<()> {
+        let parent = Path::new(path)
+            .parent()
+            .and_then(|value| value.to_str())
+            .unwrap_or("/");
+        let command = format!(
+            "set -eu; mkdir -p {parent}; tmp=$(mktemp {parent}/.nomad-bootstrapper.XXXXXX); cat > \"$tmp\"; chmod {mode:o} \"$tmp\"; if ! {validate_cmd}; then rm -f \"$tmp\"; exit 1; fi; mv \"$tmp\" {path}",
+            parent = shell_quote(parent),
+            mode = mode,
+            validate_cmd = validate_cmd,
+            path = shell_quote(path),
+        );
+        self.run_privileged_with_input_checked(&command, content.as_bytes())?;
+        Ok(())
+    }
+
     fn privileged_command(&self, command: &str) -> Result<String> {
         if self.is_dry_run() {
             return Ok(command.to_string());

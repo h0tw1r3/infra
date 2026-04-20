@@ -37,7 +37,11 @@ impl PhaseExecutor for Configure {
             ));
         }
 
-        host.write_config(NOMAD_CONFIG_PATH, &desired_config)?;
+        host.write_config_validated(
+            NOMAD_CONFIG_PATH,
+            &desired_config,
+            "nomad agent -validate -config \"$tmp\"",
+        )?;
         ctx.state.update_config_hash(&config_hash(&desired_config));
         ctx.mark_restart_required();
 
