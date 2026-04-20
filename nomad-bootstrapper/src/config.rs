@@ -302,10 +302,18 @@ impl Inventory {
         };
 
         let client_config = if roles.contains(&NodeRole::Client) {
-            if server_addresses.is_empty() {
-                anyhow::bail!("node '{}' requires at least one server_address", name);
-            }
-            Some(ClientConfig { server_addresses })
+            let addrs = if server_addresses.is_empty() {
+                if roles.contains(&NodeRole::Server) {
+                    vec!["127.0.0.1:4647".to_string()]
+                } else {
+                    anyhow::bail!("node '{}' requires at least one server_address", name);
+                }
+            } else {
+                server_addresses
+            };
+            Some(ClientConfig {
+                server_addresses: addrs,
+            })
         } else {
             None
         };
@@ -816,7 +824,6 @@ mod tests {
             host = "node-1.example.com"
             roles = ["server", "client"]
             bootstrap_expect = 1
-            server_address = ["10.0.1.1:4647"]
             server_join_address = ["10.0.1.2:4648"]
         "#,
         )
@@ -835,6 +842,27 @@ mod tests {
             node.client_config()
                 .expect("client config")
                 .server_addresses,
+            vec!["127.0.0.1:4647".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_dual_role_node_accepts_explicit_server_addresses() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "node-1"
+            host = "node-1.example.com"
+            roles = ["server", "client"]
+            bootstrap_expect = 1
+            server_address = ["10.0.1.1:4647"]
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        assert_eq!(
+            nodes[0].config.client_config().expect("client config").server_addresses,
             vec!["10.0.1.1:4647".to_string()]
         );
     }

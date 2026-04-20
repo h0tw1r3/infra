@@ -248,7 +248,6 @@ mod tests {
             host = "node-1.example.com"
             roles = ["server", "client"]
             bootstrap_expect = 1
-            server_address = ["10.0.1.1:4647"]
         "#,
         );
 
