@@ -21,10 +21,12 @@ const MODULES_LOAD_PATH: &str = "/etc/modules-load.d/nomad-br_netfilter.conf";
 const MODULES_LOAD_CONTENT: &str = "br_netfilter\n";
 
 /// Sysctl bridge settings file managed by this bootstrapper.
+/// Only the two settings required by Nomad's CNI bridge networking mode are managed here.
+/// `net.bridge.bridge-nf-call-arptables` is intentionally excluded: it is not required
+/// by Nomad and may be absent on some kernels.
 const SYSCTL_BRIDGE_PATH: &str = "/etc/sysctl.d/nomad-bridge.conf";
 const SYSCTL_BRIDGE_CONTENT: &str = "net.bridge.bridge-nf-call-iptables = 1\n\
-    net.bridge.bridge-nf-call-ip6tables = 1\n\
-    net.bridge.bridge-nf-call-arptables = 1\n";
+    net.bridge.bridge-nf-call-ip6tables = 1\n";
 
 impl PhaseExecutor for Configure {
     fn execute(
@@ -818,7 +820,7 @@ mod tests {
             },
             RemoteOutput {
                 status: 0,
-                stdout: "net.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.bridge.bridge-nf-call-arptables = 1\n".to_string(),
+                stdout: "net.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\n".to_string(),
                 stderr: String::new(),
             },
         ]);

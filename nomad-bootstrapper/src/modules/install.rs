@@ -103,6 +103,11 @@ fn ensure_cni_plugins(host: &DebianHost<'_>, config: &NodeConfig) -> Result<bool
 
     // Convergence: sentinel content matches AND all required binaries exist.
     // Short-circuit: skip binary existence checks when the sentinel already disagrees.
+    //
+    // Note on intentional asymmetry: this convergence check uses `file_exists` (path
+    // presence only). The install path below uses shell-side `test -x` (executability).
+    // This is deliberate: `file_exists` is sufficient for convergence detection, while
+    // `test -x` at install time guards against committing a sentinel after a bad extraction.
     let sentinel_ok = host
         .remote()
         .read_file(CNI_SENTINEL)?
@@ -111,31 +116,49 @@ fn ensure_cni_plugins(host: &DebianHost<'_>, config: &NodeConfig) -> Result<bool
         == Some(version.as_str());
 
     let converged = sentinel_ok
-        && CNI_REQUIRED_BINARIES.iter().all(|name| {
-            host.remote()
-                .file_exists(&format!("{}/{}", CNI_BIN_DIR, name))
-                .unwrap_or(false)
-        });
+        && CNI_REQUIRED_BINARIES
+            .iter()
+            .map(|name| {
+                host.remote()
+                    .file_exists(&format!("{}/{}", CNI_BIN_DIR, name))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .iter()
+            .all(|&exists| exists);
 
     if converged {
         return Ok(false);
     }
 
     // Download tarball, extract to /opt/cni/bin, then write sentinel on success.
+    // Order is strict: extract → validate executability → write sentinel.
+    // A `trap` ensures the temp file is removed even if an intermediate step fails.
     // The sentinel is written last so an interrupted extraction never leaves a stale marker.
     let url = format!(
         "https://github.com/containernetworking/plugins/releases/download/{version}/cni-plugins-linux-{arch}-{version}.tgz",
     );
+    let binary_checks = CNI_REQUIRED_BINARIES
+        .iter()
+        .map(|name| {
+            format!(
+                "test -x {}",
+                shell_quote(&format!("{}/{}", CNI_BIN_DIR, name))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" && ");
     let install_cmd = format!(
         "set -eu; \
-         mkdir -p {bin_dir}; \
          tmp=$(mktemp /tmp/cni-plugins.XXXXXX.tgz); \
+         trap 'rm -f \"$tmp\"' EXIT; \
+         mkdir -p {bin_dir}; \
          curl -fsSL {url} -o \"$tmp\"; \
          tar -xzf \"$tmp\" -C {bin_dir}; \
-         rm -f \"$tmp\"; \
+         {binary_checks}; \
          printf '%s' {version_q} > {sentinel_q}",
         bin_dir = shell_quote(CNI_BIN_DIR),
         url = shell_quote(&url),
+        binary_checks = binary_checks,
         version_q = shell_quote(version),
         sentinel_q = shell_quote(CNI_SENTINEL),
     );
