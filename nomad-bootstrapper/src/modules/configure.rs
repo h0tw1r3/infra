@@ -1,5 +1,6 @@
 use anyhow::Result;
 use log::warn;
+use std::collections::HashMap;
 
 use crate::debian::{normalize_config, DebianHost};
 use crate::executor::PhaseExecutor;
@@ -24,40 +25,92 @@ impl PhaseExecutor for Configure {
     ) -> Result<PhaseResult> {
         audit_config_dir(host, ctx)?;
 
-        let desired_config = render_config(config)?;
-        let existing_config = host.read_privileged_file(NOMAD_CONFIG_PATH)?;
+        let desired_hcl = render_config(config)?;
+        let desired_env = render_env_content(&config.env_vars)?;
 
-        let matches = existing_config
+        let existing_hcl = host.read_privileged_file(NOMAD_CONFIG_PATH)?;
+        let existing_env = host.read_privileged_file(NOMAD_ENV_PATH)?;
+
+        let hcl_changed = existing_hcl
             .as_deref()
-            .map(normalize_config)
-            .map(|current| current == normalize_config(&desired_config))
-            .unwrap_or(false);
+            .map(|current| normalize_config(current) != normalize_config(&desired_hcl))
+            .unwrap_or(true);
 
-        if matches {
-            host.write_env_file(NOMAD_ENV_PATH, &config.env_vars)?;
+        let env_changed = existing_env
+            .as_deref()
+            .map(|current| current != desired_env)
+            .unwrap_or(true);
+
+        if !hcl_changed && !env_changed {
             return Ok(PhaseResult::unchanged(
                 self.name(),
-                "nomad configuration already matches desired state",
+                "nomad.hcl and nomad.env already match desired state",
             ));
         }
 
-        host.write_config_validated(
-            NOMAD_CONFIG_PATH,
-            &desired_config,
-            "nomad agent -validate -config \"$tmp\"",
-        )?;
-        host.write_env_file(NOMAD_ENV_PATH, &config.env_vars)?;
+        if hcl_changed {
+            host.write_config_validated(
+                NOMAD_CONFIG_PATH,
+                &desired_hcl,
+                "nomad agent -validate -config \"$tmp\"",
+            )?;
+        }
+
+        if env_changed {
+            host.write_env_file(NOMAD_ENV_PATH, &desired_env)?;
+        }
+
         ctx.mark_restart_required();
 
-        Ok(PhaseResult::changed(
-            self.name(),
-            "wrote nomad configuration and flagged service restart",
-        ))
+        let msg = match (hcl_changed, env_changed) {
+            (true, true) => "wrote nomad.hcl and nomad.env, flagged service restart",
+            (true, false) => "wrote nomad.hcl, flagged service restart",
+            (false, true) => "wrote nomad.env, flagged service restart",
+            (false, false) => unreachable!(),
+        };
+
+        Ok(PhaseResult::changed(self.name(), msg))
     }
 
     fn name(&self) -> &'static str {
         "configure"
     }
+}
+
+/// Renders environment variables to systemd `EnvironmentFile=`-compatible content.
+///
+/// Keys are validated against `[A-Za-z_][A-Za-z0-9_]*`. Values are always
+/// double-quoted, with `\` and `"` escaped, so spaces, `#`, and other special
+/// characters are safe. Output is sorted deterministically by key.
+///
+/// # Errors
+/// Returns an error if any key contains invalid characters.
+pub fn render_env_content(vars: &HashMap<String, String>) -> Result<String> {
+    let mut keys: Vec<&str> = vars.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+
+    let mut out = String::new();
+    for key in keys {
+        if !is_valid_env_key(key) {
+            anyhow::bail!(
+                "invalid environment variable name {:?}: must match [A-Za-z_][A-Za-z0-9_]*",
+                key
+            );
+        }
+        let value = &vars[key];
+        let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+        out.push_str(&format!("{}=\"{}\"\n", key, escaped));
+    }
+    Ok(out)
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Checks `/etc/nomad.d` for unrecognized `.hcl` files that Nomad would silently load.
@@ -498,5 +551,70 @@ mod tests {
         let commands = transport.commands.lock().expect("commands lock");
         assert!(commands.iter().any(|c| c.contains("rm -f")));
         assert!(commands.iter().any(|c| c.contains("stray.hcl")));
+    }
+
+    // --- render_env_content tests ---
+
+    #[test]
+    fn test_render_env_content_empty_vars_produces_empty_string() {
+        let content = render_env_content(&HashMap::new()).expect("render empty");
+        assert_eq!(content, "");
+    }
+
+    #[test]
+    fn test_render_env_content_sorts_and_quotes_values() {
+        let mut vars = HashMap::new();
+        vars.insert("ZEBRA".to_string(), "last".to_string());
+        vars.insert("APPLE".to_string(), "first".to_string());
+        let content = render_env_content(&vars).expect("render");
+        assert_eq!(content, "APPLE=\"first\"\nZEBRA=\"last\"\n");
+    }
+
+    #[test]
+    fn test_render_env_content_escapes_backslash_and_double_quote() {
+        let mut vars = HashMap::new();
+        vars.insert("KEY".to_string(), r#"has "quotes" and \slashes\"#.to_string());
+        let content = render_env_content(&vars).expect("render");
+        assert!(content.contains(r#"KEY="has \"quotes\" and \\slashes\\""#));
+    }
+
+    #[test]
+    fn test_render_env_content_handles_value_with_spaces_and_hash() {
+        let mut vars = HashMap::new();
+        vars.insert("MSG".to_string(), "hello world # not a comment".to_string());
+        let content = render_env_content(&vars).expect("render");
+        assert_eq!(content, "MSG=\"hello world # not a comment\"\n");
+    }
+
+    #[test]
+    fn test_render_env_content_handles_empty_value() {
+        let mut vars = HashMap::new();
+        vars.insert("EMPTY".to_string(), String::new());
+        let content = render_env_content(&vars).expect("render");
+        assert_eq!(content, "EMPTY=\"\"\n");
+    }
+
+    #[test]
+    fn test_render_env_content_rejects_invalid_key_starting_with_digit() {
+        let mut vars = HashMap::new();
+        vars.insert("1INVALID".to_string(), "value".to_string());
+        let err = render_env_content(&vars).expect_err("should reject invalid key");
+        assert!(err.to_string().contains("invalid environment variable name"));
+    }
+
+    #[test]
+    fn test_render_env_content_rejects_key_with_hyphen() {
+        let mut vars = HashMap::new();
+        vars.insert("INVALID-KEY".to_string(), "value".to_string());
+        let err = render_env_content(&vars).expect_err("should reject hyphenated key");
+        assert!(err.to_string().contains("invalid environment variable name"));
+    }
+
+    #[test]
+    fn test_render_env_content_accepts_underscore_prefix() {
+        let mut vars = HashMap::new();
+        vars.insert("_PRIVATE".to_string(), "ok".to_string());
+        let content = render_env_content(&vars).expect("underscore prefix is valid");
+        assert_eq!(content, "_PRIVATE=\"ok\"\n");
     }
 }

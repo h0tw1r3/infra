@@ -425,7 +425,11 @@ impl<'a> RemoteHost<'a> {
     /// temp file before committing. `validate_cmd` is a shell fragment where `$tmp` holds
     /// the path to the staged file. If validation fails, the temp file is removed and an
     /// error is returned, leaving the destination file untouched.
-    pub fn write_file_atomic_privileged_validated(
+    ///
+    /// # Safety
+    /// `validate_cmd` is interpolated directly into a shell command. Callers must supply
+    /// a hardcoded string literal; never pass user-controlled input.
+    pub(crate) fn write_file_atomic_privileged_validated(
         &self,
         path: &str,
         content: &str,

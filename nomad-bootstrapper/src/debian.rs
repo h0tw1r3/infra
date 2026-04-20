@@ -222,18 +222,14 @@ impl<'a> DebianHost<'a> {
         Ok(())
     }
 
-    /// Writes environment variable pairs to `path` as `KEY=VALUE` lines, sorted by key.
+    /// Writes `content` atomically to `path` (mode 0o640).
     ///
-    /// Writes an empty file when `vars` is empty — required to satisfy the systemd
-    /// `EnvironmentFile=` directive used by the Nomad service unit on Debian.
-    pub fn write_env_file(&self, path: &str, vars: &std::collections::HashMap<String, String>) -> Result<()> {
-        let mut keys: Vec<&str> = vars.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        let content = keys
-            .iter()
-            .map(|k| format!("{}={}\n", k, vars[*k]))
-            .collect::<String>();
-        self.remote.write_file_atomic_privileged(path, &content, 0o640)
+    /// Used for `nomad.env` which must always exist to satisfy the systemd
+    /// `EnvironmentFile=` directive in the Nomad service unit on Debian.
+    /// Callers are responsible for rendering and validating content; use
+    /// `render_env_content` in the configure module.
+    pub fn write_env_file(&self, path: &str, content: &str) -> Result<()> {
+        self.remote.write_file_atomic_privileged(path, content, 0o640)
     }
 
     /// Writes a privileged config file at `path` (mode 0o640, root-owned).
@@ -523,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_env_file_writes_sorted_key_value_pairs() {
+    fn test_write_env_file_pipes_content_to_privileged_write() {
         let transport = RecordingTransport::new(vec![
             RemoteOutput {
                 status: 0,
@@ -539,11 +535,7 @@ mod tests {
         let target = recording_target();
         let host = DebianHost::new(RemoteHost::new(&transport, &target));
 
-        let mut vars = std::collections::HashMap::new();
-        vars.insert("NOMAD_SKIP_VERIFY".to_string(), "true".to_string());
-        vars.insert("VAULT_ADDR".to_string(), "http://vault:8200".to_string());
-
-        host.write_env_file("/etc/nomad.d/nomad.env", &vars)
+        host.write_env_file("/etc/nomad.d/nomad.env", "KEY=\"value\"\n")
             .expect("env file write");
 
         let commands = transport.commands.lock().expect("commands lock");
@@ -552,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_env_file_writes_empty_file_when_no_vars() {
+    fn test_write_env_file_accepts_empty_content() {
         let transport = RecordingTransport::new(vec![
             RemoteOutput {
                 status: 0,
@@ -568,7 +560,7 @@ mod tests {
         let target = recording_target();
         let host = DebianHost::new(RemoteHost::new(&transport, &target));
 
-        host.write_env_file("/etc/nomad.d/nomad.env", &Default::default())
+        host.write_env_file("/etc/nomad.d/nomad.env", "")
             .expect("empty env file write succeeds");
 
         let commands = transport.commands.lock().expect("commands lock");
