@@ -309,6 +309,8 @@ mod tests {
                     latency_profile: LatencyProfile::Standard,
                     env_vars: Default::default(),
                     plugins: Default::default(),
+                    plugin_dir: "/opt/nomad/plugins".to_string(),
+                    plugin_installs: Default::default(),
                 },
             })
             .collect()

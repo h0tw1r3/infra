@@ -178,6 +178,7 @@ fn render_config(config: &NodeConfig) -> Result<String> {
         format!("name = {}", render_hcl_string(&config.name)),
         format!("datacenter = {}", render_hcl_string(&config.datacenter)),
         "data_dir = \"/opt/nomad\"".to_string(),
+        format!("plugin_dir = {}", render_hcl_string(&config.plugin_dir)),
         format!("bind_addr = {}", render_hcl_string(bind_addr)),
         String::new(),
         "advertise {".to_string(),
@@ -560,6 +561,8 @@ mod tests {
             latency_profile: LatencyProfile::Standard,
             env_vars: Default::default(),
             plugins: Default::default(),
+            plugin_dir: "/opt/nomad/plugins".to_string(),
+            plugin_installs: Default::default(),
         }
     }
 
@@ -579,6 +582,8 @@ mod tests {
             latency_profile: LatencyProfile::Standard,
             env_vars: Default::default(),
             plugins: Default::default(),
+            plugin_dir: "/opt/nomad/plugins".to_string(),
+            plugin_installs: Default::default(),
         }
     }
 
@@ -687,6 +692,21 @@ mod tests {
             servers_pos > client_pos && servers_pos < close_pos,
             "servers should be inside client {{ }} block"
         );
+    }
+
+    #[test]
+    fn test_render_config_includes_plugin_dir() {
+        let rendered = render_config(&server_node_config()).expect("rendered config");
+        assert!(rendered.contains("plugin_dir = \"/opt/nomad/plugins\""));
+    }
+
+    #[test]
+    fn test_render_config_uses_custom_plugin_dir() {
+        let mut config = server_node_config();
+        config.plugin_dir = "/custom/plugins".to_string();
+
+        let rendered = render_config(&config).expect("rendered config");
+        assert!(rendered.contains("plugin_dir = \"/custom/plugins\""));
     }
 
     #[test]
@@ -1377,7 +1397,7 @@ mod tests {
         // rendering is never attempted for non-client nodes.
         let rendered = render_config(&config).expect("server-only node must not error");
         assert!(
-            !rendered.contains("plugin"),
+            !rendered.contains("plugin \""),
             "no plugin stanza must appear for server-only node"
         );
     }

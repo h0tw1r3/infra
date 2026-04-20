@@ -54,6 +54,32 @@ pub struct AdvertiseConfig {
     pub serf: Option<String>,
 }
 
+/// Resolved installation config for a single Nomad task driver plugin.
+///
+/// Each variant describes how to obtain the plugin binary and where it lives
+/// after installation, so the install phase can place it into `plugin_dir`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(tag = "method", rename_all = "lowercase")]
+pub enum PluginInstallConfig {
+    /// Download a release tarball and extract a named binary from it.
+    ///
+    /// `url` may contain `{arch}` which is substituted with the target arch
+    /// (`amd64` or `arm64`) at install time.
+    /// `binary` is the path of the binary *inside* the tarball (can be a bare
+    /// filename or a relative path like `linux-amd64/nomad-driver-foo`).
+    Tarball { url: String, binary: String },
+    /// Install via `apt-get` and symlink the installed binary into `plugin_dir`.
+    ///
+    /// `binary` is the *full path* where apt drops the executable
+    /// (e.g. `/usr/sbin/nomad-driver-lxc`). A symlink
+    /// `plugin_dir/<filename>` → `binary` is created if absent.
+    Apt {
+        package: String,
+        version: Option<String>,
+        binary: String,
+    },
+}
+
 /// Resolved per-node Nomad intent from the inventory.
 ///
 /// Invariant: `roles` is the authoritative list of intended capabilities, and
@@ -65,10 +91,9 @@ pub struct AdvertiseConfig {
 /// fixtures should preserve this invariant because configuration rendering
 /// branches on `roles` and then reads the matching role-specific payload.
 ///
-/// `cni_version` and `plugins` are structurally present for all nodes but
-/// only consumed when the node has the `client` role. Non-client nodes carry
-/// these fields with no operational effect; non-client nodes with non-empty
-/// `plugins` emit a warning during the configure phase and skip rendering.
+/// `cni_version`, `plugins`, `plugin_dir`, and `plugin_installs` are
+/// structurally present for all nodes but only consumed when the node has the
+/// `client` role.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeConfig {
     pub name: String,
@@ -82,10 +107,17 @@ pub struct NodeConfig {
     pub advertise: AdvertiseConfig,
     pub latency_profile: LatencyProfile,
     pub env_vars: HashMap<String, String>,
-    /// Task driver plugin configuration, deep-merged from inventory defaults and
+    /// Task driver plugin HCL config, deep-merged from inventory defaults and
     /// per-node overrides. Present for all nodes; rendered into `nomad.hcl` only
     /// when the client role is present.
     pub plugins: HashMap<String, toml::Table>,
+    /// Directory where Nomad looks for task driver plugin binaries.
+    /// Defaults to `<data_dir>/plugins` = `/opt/nomad/plugins`.
+    pub plugin_dir: String,
+    /// Driver plugin installation specs, merged from inventory defaults and
+    /// per-node overrides. Node entry fully replaces the default for that driver.
+    /// Only consumed for client nodes during the install phase.
+    pub plugin_installs: HashMap<String, PluginInstallConfig>,
 }
 
 impl NodeConfig {
@@ -211,6 +243,8 @@ mod tests {
             latency_profile: LatencyProfile::Standard,
             env_vars: Default::default(),
             plugins: Default::default(),
+            plugin_dir: "/opt/nomad/plugins".to_string(),
+            plugin_installs: Default::default(),
         }
     }
 

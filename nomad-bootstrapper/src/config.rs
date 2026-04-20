@@ -10,8 +10,8 @@ use serde::Deserialize;
 
 use crate::executor::PHASE_NAMES;
 use crate::models::{
-    AdvertiseConfig, ClientConfig, LatencyProfile, NodeConfig, NodeRole, ResolvedNode,
-    ResolvedTarget, ServerConfig,
+    AdvertiseConfig, ClientConfig, LatencyProfile, NodeConfig, NodeRole, PluginInstallConfig,
+    ResolvedNode, ResolvedTarget, ServerConfig,
 };
 
 #[derive(Parser, Debug)]
@@ -72,6 +72,9 @@ pub struct ClusterConfig {
     pub datacenter: String,
     #[serde(default)]
     pub env_vars: HashMap<String, String>,
+    /// Override the directory where Nomad looks for task driver plugin binaries.
+    /// Defaults to `<data_dir>/plugins` = `/opt/nomad/plugins`.
+    pub plugin_dir: Option<String>,
 }
 
 impl ClusterConfig {
@@ -85,6 +88,7 @@ impl Default for ClusterConfig {
         Self {
             datacenter: Self::default_datacenter(),
             env_vars: HashMap::new(),
+            plugin_dir: None,
         }
     }
 }
@@ -99,6 +103,11 @@ pub struct DefaultsConfig {
     /// Deep-merged with per-node plugin overrides; node values win on conflict.
     #[serde(default)]
     pub plugins: HashMap<String, toml::Table>,
+    /// Default driver plugin installation specs. Each entry is keyed by the
+    /// driver name (e.g. "containerd-driver"). A per-node `plugin_install` entry
+    /// for the same driver *replaces* the default entirely (no deep merge).
+    #[serde(default)]
+    pub plugin_install: HashMap<String, PluginInstallConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -193,6 +202,11 @@ pub struct NodeInventory {
     /// Absent field defaults to an empty map for backward compatibility.
     #[serde(default)]
     pub plugins: HashMap<String, toml::Table>,
+    /// Per-node driver plugin installation overrides. Each entry *replaces* the
+    /// corresponding default entry entirely (no deep merge). Absent entries fall
+    /// back to `[defaults.plugin_install]`.
+    #[serde(default)]
+    pub plugin_install: HashMap<String, PluginInstallConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -316,6 +330,19 @@ impl Inventory {
             plugins.insert(driver.clone(), merged);
         }
 
+        // Plugin installs: start from defaults, node entry replaces (not merges) per driver.
+        let mut plugin_installs = self.defaults.plugin_install.clone();
+        for (driver, node_install) in &node.plugin_install {
+            plugin_installs.insert(driver.clone(), node_install.clone());
+        }
+
+        // plugin_dir: cluster-level override → default path under data_dir.
+        let plugin_dir = self
+            .cluster
+            .plugin_dir
+            .clone()
+            .unwrap_or_else(|| "/opt/nomad/plugins".to_string());
+
         let server_config = if roles.contains(&NodeRole::Server) {
             let bootstrap_expect = node.bootstrap_expect.ok_or_else(|| {
                 anyhow::anyhow!("node '{}' requires bootstrap_expect for server role", name)
@@ -361,6 +388,8 @@ impl Inventory {
             latency_profile,
             env_vars,
             plugins,
+            plugin_dir,
+            plugin_installs,
         };
 
         Ok(ResolvedNode {
@@ -1370,5 +1399,121 @@ mod tests {
         assert!(inventory.defaults.plugins.is_empty());
         let node = &inventory.nodes[0];
         assert!(node.plugins.is_empty());
+    }
+
+    #[test]
+    fn test_plugin_dir_defaults_to_opt_nomad_plugins() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "client-1"
+            host = "client-1.example.com"
+            roles = ["client"]
+            server_address = ["10.0.1.1:4647"]
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        assert_eq!(nodes[0].config.plugin_dir, "/opt/nomad/plugins");
+    }
+
+    #[test]
+    fn test_plugin_dir_cluster_override_propagates_to_nodes() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [cluster]
+            plugin_dir = "/custom/plugins"
+
+            [[nodes]]
+            name = "client-1"
+            host = "client-1.example.com"
+            roles = ["client"]
+            server_address = ["10.0.1.1:4647"]
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        assert_eq!(nodes[0].config.plugin_dir, "/custom/plugins");
+    }
+
+    #[test]
+    fn test_plugin_install_defaults_resolved_when_no_node_override() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [defaults.plugin_install.containerd-driver]
+            method = "tarball"
+            url = "https://example.com/containerd_{arch}.tar.gz"
+            binary = "nomad-driver-containerd"
+
+            [[nodes]]
+            name = "client-1"
+            host = "client-1.example.com"
+            roles = ["client"]
+            server_address = ["10.0.1.1:4647"]
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        let install = &nodes[0].config.plugin_installs;
+        assert!(matches!(
+            install.get("containerd-driver"),
+            Some(PluginInstallConfig::Tarball { url, binary })
+                if url == "https://example.com/containerd_{arch}.tar.gz"
+                && binary == "nomad-driver-containerd"
+        ));
+    }
+
+    #[test]
+    fn test_plugin_install_node_entry_replaces_default() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [defaults.plugin_install.lxc]
+            method = "apt"
+            package = "nomad-driver-lxc"
+            version = "1.0.0"
+            binary = "/usr/sbin/nomad-driver-lxc"
+
+            [[nodes]]
+            name = "client-1"
+            host = "client-1.example.com"
+            roles = ["client"]
+            server_address = ["10.0.1.1:4647"]
+
+            [nodes.plugin_install.lxc]
+            method = "apt"
+            package = "nomad-driver-lxc"
+            version = "2.0.0"
+            binary = "/usr/sbin/nomad-driver-lxc"
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        let install = &nodes[0].config.plugin_installs;
+        // Node version overrides default version; entire entry replaced.
+        assert!(matches!(
+            install.get("lxc"),
+            Some(PluginInstallConfig::Apt { version: Some(v), .. }) if v == "2.0.0"
+        ));
+    }
+
+    #[test]
+    fn test_plugin_install_empty_when_not_configured() {
+        let inventory: Inventory = toml::from_str(
+            r#"
+            [[nodes]]
+            name = "server-1"
+            host = "server-1.example.com"
+            roles = ["server"]
+            bootstrap_expect = 1
+        "#,
+        )
+        .expect("inventory parses");
+
+        let nodes = inventory.resolve_nodes().expect("nodes resolve");
+        assert!(nodes[0].config.plugin_installs.is_empty());
     }
 }
