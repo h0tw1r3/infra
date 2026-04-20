@@ -54,6 +54,28 @@ pub struct AdvertiseConfig {
     pub serf: Option<String>,
 }
 
+/// Arch-keyed URL map or a single URL string (optionally containing `{arch}`).
+///
+/// ## Single URL
+/// ```toml
+/// url = "https://example.com/driver_{arch}_linux.tar.gz"
+/// ```
+/// The `{arch}` placeholder is substituted with `amd64` or `arm64` at install time.
+///
+/// ## Arch-keyed map
+/// Use this when the amd64 and arm64 URLs differ in structure (e.g. different filenames):
+/// ```toml
+/// [plugin.url]
+/// amd64 = "https://example.com/driver"
+/// arm64 = "https://example.com/driver-arm64"
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum UrlSpec {
+    Single(String),
+    ArchMap(HashMap<String, String>),
+}
+
 /// Resolved installation config for a single Nomad task driver plugin.
 ///
 /// Each variant describes how to obtain the plugin binary and where it lives
@@ -64,6 +86,8 @@ pub struct AdvertiseConfig {
 ///   within the archive** after extraction (e.g. `"nomad-driver-containerd"` or
 ///   `"linux-amd64/nomad-driver-foo"`). The binary is moved to
 ///   `plugin_dir/<basename(binary)>`.
+/// - **`Binary`**: `binary` is the **destination filename** in `plugin_dir`
+///   (e.g. `"nomad-driver-containerd"`). The file is downloaded directly from `url`.
 /// - **`Apt`**: `binary` is the **absolute on-disk path** where the package
 ///   installs the executable (e.g. `"/usr/sbin/nomad-driver-lxc"`). A symlink
 ///   `plugin_dir/<basename(binary)>` → `binary` is created or corrected.
@@ -72,13 +96,19 @@ pub struct AdvertiseConfig {
 pub enum PluginInstallConfig {
     /// Download a release tarball and extract a named binary from it.
     ///
-    /// `url` may contain `{arch}` which is substituted with the target arch
-    /// (`amd64` or `arm64`) at install time. Use version-pinned, immutable URLs —
-    /// mutable "latest" URLs defeat idempotency.
+    /// `url` may be a single URL (with optional `{arch}` placeholder) or an arch-keyed
+    /// map. Use version-pinned, immutable URLs — mutable "latest" URLs defeat idempotency.
     ///
     /// `binary` is the path of the binary *inside* the tarball after extraction
     /// (can be a bare filename or a relative path like `linux-amd64/nomad-driver-foo`).
-    Tarball { url: String, binary: String },
+    Tarball { url: UrlSpec, binary: String },
+    /// Download a single binary file directly (no tarball extraction).
+    ///
+    /// `url` may be a single URL (with optional `{arch}` placeholder) or an arch-keyed
+    /// map. Use version-pinned, immutable URLs — mutable "latest" URLs defeat idempotency.
+    ///
+    /// `binary` is the destination **filename** in `plugin_dir` (e.g. `"containerd-driver"`).
+    Binary { url: UrlSpec, binary: String },
     /// Install via `apt-get` and symlink the installed binary into `plugin_dir`.
     ///
     /// `binary` is the *full absolute path* where apt drops the executable

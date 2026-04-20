@@ -647,6 +647,7 @@ fn validate_address(val: &str, default_port: u16) -> std::result::Result<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::UrlSpec;
 
     const INVENTORY: &str = r#"
         [cluster]
@@ -1468,7 +1469,7 @@ mod tests {
         let install = &nodes[0].config.plugin_installs;
         assert!(matches!(
             install.get("containerd-driver"),
-            Some(PluginInstallConfig::Tarball { url, binary })
+            Some(PluginInstallConfig::Tarball { url: UrlSpec::Single(url), binary })
                 if url == "https://example.com/containerd_{arch}.tar.gz"
                 && binary == "nomad-driver-containerd"
         ));

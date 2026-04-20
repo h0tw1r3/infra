@@ -4,7 +4,9 @@ use anyhow::Result;
 
 use crate::debian::DebianHost;
 use crate::executor::PhaseExecutor;
-use crate::models::{ExecutionContext, NodeConfig, NodeRole, PhaseResult, PluginInstallConfig};
+use crate::models::{
+    ExecutionContext, NodeConfig, NodeRole, PhaseResult, PluginInstallConfig, UrlSpec,
+};
 use crate::transport::shell_quote;
 
 /// Directory where CNI plugin binaries are installed.
@@ -218,6 +220,7 @@ fn ensure_driver_plugins(host: &DebianHost<'_>, config: &NodeConfig) -> Result<b
     for (driver_name, install_config) in &config.plugin_installs {
         let bin = match install_config {
             PluginInstallConfig::Tarball { binary, .. } => binary.as_str(),
+            PluginInstallConfig::Binary { binary, .. } => binary.as_str(),
             PluginInstallConfig::Apt { binary, .. } => binary.as_str(),
         };
         let bname = basename(bin);
@@ -232,13 +235,16 @@ fn ensure_driver_plugins(host: &DebianHost<'_>, config: &NodeConfig) -> Result<b
         }
     }
 
-    // Resolve arch once — shared across all tarball plugins on this node.
-    // In dry-run mode we skip the remote probe and fall back to 'amd64'; warn so operators on
-    // ARM hosts know the displayed URLs may not reflect their actual target architecture.
-    let needs_arch = config
-        .plugin_installs
-        .values()
-        .any(|p| matches!(p, PluginInstallConfig::Tarball { url, .. } if url.contains("{arch}")));
+    // Resolve arch once — shared across all plugins that need it (tarball/binary with {arch}
+    // or ArchMap).  In dry-run mode we skip the remote probe and fall back to 'amd64'; warn so
+    // operators on ARM hosts know the displayed URLs may not reflect their actual target arch.
+    let needs_arch = config.plugin_installs.values().any(|p| match p {
+        PluginInstallConfig::Tarball { url, .. } | PluginInstallConfig::Binary { url, .. } => {
+            matches!(url, UrlSpec::ArchMap(_))
+                || matches!(url, UrlSpec::Single(s) if s.contains("{arch}"))
+        }
+        PluginInstallConfig::Apt { .. } => false,
+    });
     let arch_cache: Option<&'static str> = if needs_arch {
         if host.remote().is_dry_run() {
             log::warn!(
@@ -265,8 +271,13 @@ fn ensure_driver_plugins(host: &DebianHost<'_>, config: &NodeConfig) -> Result<b
         let changed = match install_config {
             PluginInstallConfig::Tarball { url, binary } => {
                 let arch = arch_cache.unwrap_or("amd64");
-                let resolved_url = url.replace("{arch}", arch);
+                let resolved_url = resolve_url_spec(url, arch, driver_name)?;
                 ensure_tarball_plugin(host, driver_name, &resolved_url, binary, &config.plugin_dir)?
+            }
+            PluginInstallConfig::Binary { url, binary } => {
+                let arch = arch_cache.unwrap_or("amd64");
+                let resolved_url = resolve_url_spec(url, arch, driver_name)?;
+                ensure_binary_plugin(host, driver_name, &resolved_url, binary, &config.plugin_dir)?
             }
             PluginInstallConfig::Apt {
                 package,
@@ -289,7 +300,82 @@ fn ensure_driver_plugins(host: &DebianHost<'_>, config: &NodeConfig) -> Result<b
     Ok(any_changed)
 }
 
-/// Installs a driver plugin binary from a release tarball into `plugin_dir`.
+/// Resolves a `UrlSpec` to a concrete URL string for the given architecture.
+///
+/// - `UrlSpec::Single`: substitutes `{arch}` placeholder (if present).
+/// - `UrlSpec::ArchMap`: looks up `arch` in the map; returns an error if missing.
+fn resolve_url_spec(url_spec: &UrlSpec, arch: &str, driver_name: &str) -> Result<String> {
+    match url_spec {
+        UrlSpec::Single(url) => Ok(url.replace("{arch}", arch)),
+        UrlSpec::ArchMap(map) => map.get(arch).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "driver plugin '{}': no URL defined for arch '{}' in url map; \
+                     add an '{}' entry to the inventory",
+                driver_name,
+                arch,
+                arch
+            )
+        }),
+    }
+}
+
+/// Installs a driver plugin by downloading a single binary file directly into `plugin_dir`.
+///
+/// ## Idempotency
+/// A sentinel file `plugin_dir/.installed-<driver_name>` stores two lines:
+/// - line 1: the resolved download URL
+/// - line 2: the configured destination binary name
+///
+/// Convergence is skipped if the sentinel matches both values, the destination binary
+/// exists, and it is executable. A malformed or missing sentinel triggers reinstall.
+///
+/// Returns `true` if a change was made.
+fn ensure_binary_plugin(
+    host: &DebianHost<'_>,
+    driver_name: &str,
+    url: &str,
+    binary: &str,
+    plugin_dir: &str,
+) -> Result<bool> {
+    let sentinel = format!("{}/.installed-{}", plugin_dir, driver_name);
+    let dest = format!("{}/{}", plugin_dir, binary);
+
+    // Convergence: sentinel matches URL + binary name, dest exists, dest is executable.
+    let sentinel_content = host.remote().read_file(&sentinel)?.unwrap_or_default();
+    let sentinel_ok = parse_tarball_sentinel(&sentinel_content)
+        .map(|(s_url, s_binary)| s_url == url && s_binary == binary)
+        .unwrap_or(false);
+
+    let dest_ok = sentinel_ok
+        && host.remote().file_exists(&dest)?
+        && host
+            .remote()
+            .run(&format!("[ -x {} ]", shell_quote(&dest)))?
+            .success();
+
+    if dest_ok {
+        return Ok(false);
+    }
+
+    // Download directly into plugin_dir, chmod +x, then write sentinel last.
+    let install_cmd = format!(
+        "set -eu; \
+         mkdir -p {plugin_dir_q}; \
+         curl -fsSL {url_q} -o {dest_q}; \
+         chmod +x {dest_q}; \
+         printf '%s\\n%s' {url_store_q} {binary_store_q} > {sentinel_q}",
+        plugin_dir_q = shell_quote(plugin_dir),
+        url_q = shell_quote(url),
+        dest_q = shell_quote(&dest),
+        url_store_q = shell_quote(url),
+        binary_store_q = shell_quote(binary),
+        sentinel_q = shell_quote(&sentinel),
+    );
+    host.remote().run_privileged_checked(&install_cmd)?;
+
+    Ok(true)
+}
+
 ///
 /// ## Idempotency
 /// A sentinel file `plugin_dir/.installed-<driver_name>` stores two lines:
@@ -1051,7 +1137,7 @@ mod tests {
         config.plugin_installs.insert(
             "containerd-driver".to_string(),
             PluginInstallConfig::Tarball {
-                url: "https://example.com/containerd_{arch}.tar.gz".to_string(),
+                url: UrlSpec::Single("https://example.com/containerd_{arch}.tar.gz".to_string()),
                 binary: "nomad-driver-containerd".to_string(),
             },
         );
@@ -1114,7 +1200,7 @@ mod tests {
         config.plugin_installs.insert(
             "containerd-driver".to_string(),
             PluginInstallConfig::Tarball {
-                url: url.to_string(),
+                url: UrlSpec::Single(url.to_string()),
                 binary: binary.to_string(),
             },
         );
@@ -1317,7 +1403,7 @@ mod tests {
         config.plugin_installs.insert(
             "containerd-driver".to_string(),
             PluginInstallConfig::Tarball {
-                url: url.to_string(),
+                url: UrlSpec::Single(url.to_string()),
                 binary: binary.to_string(),
             },
         );
@@ -1482,7 +1568,7 @@ mod tests {
         config.plugin_installs.insert(
             "plugin-b".to_string(),
             PluginInstallConfig::Tarball {
-                url: "https://example.com/foo.tar.gz".to_string(),
+                url: UrlSpec::Single("https://example.com/foo.tar.gz".to_string()),
                 binary: "subdir/nomad-driver-foo".to_string(), // same basename
             },
         );
@@ -1507,5 +1593,236 @@ mod tests {
             "nomad-driver-containerd"
         );
         assert_eq!(basename("linux-amd64/nomad-driver-foo"), "nomad-driver-foo");
+    }
+
+    // ── resolve_url_spec ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_url_spec_single_substitutes_arch() {
+        let spec = UrlSpec::Single("https://example.com/driver_{arch}_linux.tar.gz".to_string());
+        assert_eq!(
+            resolve_url_spec(&spec, "amd64", "test").unwrap(),
+            "https://example.com/driver_amd64_linux.tar.gz"
+        );
+        assert_eq!(
+            resolve_url_spec(&spec, "arm64", "test").unwrap(),
+            "https://example.com/driver_arm64_linux.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_url_spec_single_no_placeholder() {
+        let spec = UrlSpec::Single("https://example.com/driver".to_string());
+        assert_eq!(
+            resolve_url_spec(&spec, "amd64", "test").unwrap(),
+            "https://example.com/driver"
+        );
+    }
+
+    #[test]
+    fn test_resolve_url_spec_arch_map_looks_up_arch() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "amd64".to_string(),
+            "https://example.com/driver".to_string(),
+        );
+        map.insert(
+            "arm64".to_string(),
+            "https://example.com/driver-arm64".to_string(),
+        );
+        let spec = UrlSpec::ArchMap(map);
+        assert_eq!(
+            resolve_url_spec(&spec, "amd64", "test").unwrap(),
+            "https://example.com/driver"
+        );
+        assert_eq!(
+            resolve_url_spec(&spec, "arm64", "test").unwrap(),
+            "https://example.com/driver-arm64"
+        );
+    }
+
+    #[test]
+    fn test_resolve_url_spec_arch_map_missing_arch_errors() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "amd64".to_string(),
+            "https://example.com/driver".to_string(),
+        );
+        let spec = UrlSpec::ArchMap(map);
+        let err = resolve_url_spec(&spec, "arm64", "containerd-driver").unwrap_err();
+        assert!(err.to_string().contains("arm64"));
+        assert!(err.to_string().contains("containerd-driver"));
+    }
+
+    // ── ensure_binary_plugin ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_binary_plugin_installs_when_sentinel_missing() {
+        let mut config = client_node_config();
+        let url = "https://github.com/Roblox/nomad-driver-containerd/releases/download/v0.9.4/containerd-driver";
+        let binary = "containerd-driver";
+        config.plugin_installs.insert(
+            "containerd-driver".to_string(),
+            PluginInstallConfig::Binary {
+                url: UrlSpec::Single(url.to_string()),
+                binary: binary.to_string(),
+            },
+        );
+
+        let mut responses = nomad_and_cni_current_responses();
+        responses.extend([
+            // No uname -m needed: URL has no {arch} placeholder.
+            // read sentinel → absent (None)
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            // id -u (privilege check)
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            // install command
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        ]);
+
+        let transport = RecordingTransport::new(responses);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+        let mut ctx = ExecutionContext::default();
+
+        let result = Install
+            .execute(&host, &config, &mut ctx)
+            .expect("install succeeds");
+
+        assert!(result.changes_made);
+        let commands = transport.commands.lock().expect("commands lock");
+        let install_cmd = commands.last().expect("install command present");
+        assert!(install_cmd.contains("containerd-driver"));
+        assert!(install_cmd.contains(".installed-containerd-driver"));
+        assert!(install_cmd.contains("/opt/nomad/plugins"));
+        // Direct download: no tar, no mktemp -d
+        assert!(!install_cmd.contains("tar"));
+        assert!(!install_cmd.contains("mktemp -d"));
+        assert!(install_cmd.contains("curl"));
+        assert!(install_cmd.contains("chmod +x"));
+    }
+
+    #[test]
+    fn test_binary_plugin_skipped_when_already_converged() {
+        let mut config = client_node_config();
+        let url = "https://github.com/Roblox/nomad-driver-containerd/releases/download/v0.9.4/containerd-driver";
+        let binary = "containerd-driver";
+        config.plugin_installs.insert(
+            "containerd-driver".to_string(),
+            PluginInstallConfig::Binary {
+                url: UrlSpec::Single(url.to_string()),
+                binary: binary.to_string(),
+            },
+        );
+
+        let mut responses = nomad_and_cni_current_responses();
+        responses.extend([
+            // read sentinel → matches (2-line: URL\nbinary)
+            RemoteOutput {
+                status: 0,
+                stdout: format!("{}\n{}", url, binary),
+                stderr: String::new(),
+            },
+            // file_exists binary → present
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            // [ -x binary ] → executable
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        ]);
+
+        let transport = RecordingTransport::new(responses);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+        let mut ctx = ExecutionContext::default();
+
+        let result = Install
+            .execute(&host, &config, &mut ctx)
+            .expect("install succeeds");
+
+        assert!(!result.changes_made);
+    }
+
+    #[test]
+    fn test_binary_plugin_with_arch_map_uses_correct_url() {
+        let mut config = client_node_config();
+        let mut url_map = std::collections::HashMap::new();
+        url_map.insert(
+            "amd64".to_string(),
+            "https://example.com/driver".to_string(),
+        );
+        url_map.insert(
+            "arm64".to_string(),
+            "https://example.com/driver-arm64".to_string(),
+        );
+        config.plugin_installs.insert(
+            "containerd-driver".to_string(),
+            PluginInstallConfig::Binary {
+                url: UrlSpec::ArchMap(url_map),
+                binary: "containerd-driver".to_string(),
+            },
+        );
+
+        let mut responses = nomad_and_cni_current_responses();
+        responses.extend([
+            // uname -m → x86_64 (amd64)
+            RemoteOutput {
+                status: 0,
+                stdout: "x86_64\n".to_string(),
+                stderr: String::new(),
+            },
+            // read sentinel → absent
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            // id -u
+            RemoteOutput {
+                status: 0,
+                stdout: "0\n".to_string(),
+                stderr: String::new(),
+            },
+            // install command
+            RemoteOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        ]);
+
+        let transport = RecordingTransport::new(responses);
+        let target = recording_target();
+        let host = DebianHost::new(RemoteHost::new(&transport, &target));
+        let mut ctx = ExecutionContext::default();
+
+        let result = Install
+            .execute(&host, &config, &mut ctx)
+            .expect("install succeeds");
+
+        assert!(result.changes_made);
+        let commands = transport.commands.lock().expect("commands lock");
+        let install_cmd = commands.last().expect("install command present");
+        // Should use the amd64 URL (not the arm64 one)
+        assert!(install_cmd.contains("https://example.com/driver'"));
+        assert!(!install_cmd.contains("arm64"));
     }
 }
