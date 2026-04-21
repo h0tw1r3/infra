@@ -15,7 +15,7 @@ impl PhaseExecutor for EnsureDeps {
     ) -> Result<PhaseResult> {
         let mut required_packages: Vec<&str> = vec!["curl", "gnupg", "ca-certificates"];
 
-        // Require `unzip` if any tarball plugin uses a .zip archive URL.
+        // Require `unzip` if any archive plugin uses a .zip URL.
         if needs_unzip(config) {
             required_packages.push("unzip");
         }
@@ -51,10 +51,10 @@ impl PhaseExecutor for EnsureDeps {
     }
 }
 
-/// Returns `true` if any tarball plugin install config uses a `.zip` archive URL.
+/// Returns `true` if any archive plugin install uses a `.zip` URL.
 fn needs_unzip(config: &NodeConfig) -> bool {
     config.plugin_installs.values().any(|p| match p {
-        PluginInstallConfig::Tarball { url, .. } => url_spec_has_zip(url),
+        PluginInstallConfig::Archive { url, .. } => url_spec_has_zip(url),
         _ => false,
     })
 }
@@ -100,11 +100,11 @@ mod tests {
     }
 
     #[test]
-    fn test_needs_unzip_false_for_tgz_tarball() {
+    fn test_needs_unzip_false_for_tgz_archive() {
         let mut config = base_config();
         config.plugin_installs.insert(
             "driver".to_string(),
-            PluginInstallConfig::Tarball {
+            PluginInstallConfig::Archive {
                 url: UrlSpec::Single("https://example.com/driver_linux_amd64.tar.gz".to_string()),
                 binary: "driver".to_string(),
             },
@@ -113,11 +113,11 @@ mod tests {
     }
 
     #[test]
-    fn test_needs_unzip_true_for_zip_tarball_single() {
+    fn test_needs_unzip_true_for_zip_archive_single() {
         let mut config = base_config();
         config.plugin_installs.insert(
             "exec2".to_string(),
-            PluginInstallConfig::Tarball {
+            PluginInstallConfig::Archive {
                 url: UrlSpec::Single(
                     "https://releases.hashicorp.com/nomad-driver-exec2/0.1.1/nomad-driver-exec2_0.1.1_linux_amd64.zip".to_string(),
                 ),
@@ -141,7 +141,7 @@ mod tests {
         );
         config.plugin_installs.insert(
             "exec2".to_string(),
-            PluginInstallConfig::Tarball {
+            PluginInstallConfig::Archive {
                 url: UrlSpec::ArchMap(map),
                 binary: "nomad-driver-exec2".to_string(),
             },

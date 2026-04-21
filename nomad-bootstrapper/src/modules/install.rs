@@ -192,7 +192,7 @@ fn map_cni_arch(uname: &str) -> Result<&'static str> {
     }
 }
 
-/// Maps `uname -m` output to the arch label used in driver plugin tarball URLs.
+/// Maps `uname -m` output to the arch label used in driver plugin archive URLs.
 ///
 /// Supports the same `{arch}` substitution as CNI plugins.
 fn map_plugin_arch(uname: &str) -> Result<&'static str> {
@@ -219,7 +219,7 @@ fn ensure_driver_plugins(host: &DebianHost<'_>, config: &NodeConfig) -> Result<b
     let mut seen_basenames: HashMap<&str, &str> = HashMap::new();
     for (driver_name, install_config) in &config.plugin_installs {
         let bin = match install_config {
-            PluginInstallConfig::Tarball { binary, .. } => binary.as_str(),
+            PluginInstallConfig::Archive { binary, .. } => binary.as_str(),
             PluginInstallConfig::Binary { binary, .. } => binary.as_str(),
             PluginInstallConfig::Apt { binary, .. } => binary.as_str(),
         };
@@ -235,11 +235,11 @@ fn ensure_driver_plugins(host: &DebianHost<'_>, config: &NodeConfig) -> Result<b
         }
     }
 
-    // Resolve arch once — shared across all plugins that need it (tarball/binary with {arch}
+    // Resolve arch once — shared across all plugins that need it (archive/binary with {arch}
     // or ArchMap).  In dry-run mode we skip the remote probe and fall back to 'amd64'; warn so
     // operators on ARM hosts know the displayed URLs may not reflect their actual target arch.
     let needs_arch = config.plugin_installs.values().any(|p| match p {
-        PluginInstallConfig::Tarball { url, .. } | PluginInstallConfig::Binary { url, .. } => {
+        PluginInstallConfig::Archive { url, .. } | PluginInstallConfig::Binary { url, .. } => {
             matches!(url, UrlSpec::ArchMap(_))
                 || matches!(url, UrlSpec::Single(s) if s.contains("{arch}"))
         }
@@ -248,7 +248,7 @@ fn ensure_driver_plugins(host: &DebianHost<'_>, config: &NodeConfig) -> Result<b
     let arch_cache: Option<&'static str> = if needs_arch {
         if host.remote().is_dry_run() {
             log::warn!(
-                "dry-run: {{arch}} placeholder in tarball URL resolved to 'amd64'; \
+                "dry-run: {{arch}} placeholder in archive URL resolved to 'amd64'; \
                  actual architecture may differ on the target host"
             );
             Some("amd64")
@@ -269,10 +269,10 @@ fn ensure_driver_plugins(host: &DebianHost<'_>, config: &NodeConfig) -> Result<b
 
     for (driver_name, install_config) in sorted_installs {
         let changed = match install_config {
-            PluginInstallConfig::Tarball { url, binary } => {
+            PluginInstallConfig::Archive { url, binary } => {
                 let arch = arch_cache.unwrap_or("amd64");
                 let resolved_url = resolve_url_spec(url, arch, driver_name)?;
-                ensure_tarball_plugin(host, driver_name, &resolved_url, binary, &config.plugin_dir)?
+                ensure_archive_plugin(host, driver_name, &resolved_url, binary, &config.plugin_dir)?
             }
             PluginInstallConfig::Binary { url, binary } => {
                 let arch = arch_cache.unwrap_or("amd64");
@@ -342,7 +342,7 @@ fn ensure_binary_plugin(
 
     // Convergence: sentinel matches URL + binary name, dest exists, dest is executable.
     let sentinel_content = host.remote().read_file(&sentinel)?.unwrap_or_default();
-    let sentinel_ok = parse_tarball_sentinel(&sentinel_content)
+    let sentinel_ok = parse_archive_sentinel(&sentinel_content)
         .map(|(s_url, s_binary)| s_url == url && s_binary == binary)
         .unwrap_or(false);
 
@@ -403,7 +403,7 @@ fn ensure_binary_plugin(
 /// filesystem), so the final `mv` into `plugin_dir` is a guaranteed atomic rename.
 ///
 /// Returns `true` if a change was made.
-fn ensure_tarball_plugin(
+fn ensure_archive_plugin(
     host: &DebianHost<'_>,
     driver_name: &str,
     url: &str,
@@ -415,7 +415,7 @@ fn ensure_tarball_plugin(
 
     // Convergence: sentinel matches URL + binary path, dest exists, dest is executable.
     let sentinel_content = host.remote().read_file(&sentinel)?.unwrap_or_default();
-    let sentinel_ok = parse_tarball_sentinel(&sentinel_content)
+    let sentinel_ok = parse_archive_sentinel(&sentinel_content)
         .map(|(s_url, s_binary)| s_url == url && s_binary == binary)
         .unwrap_or(false);
 
@@ -471,12 +471,12 @@ fn ensure_tarball_plugin(
     Ok(true)
 }
 
-/// Parses the two-line tarball sentinel format.
+/// Parses the two-line archive sentinel format.
 ///
 /// Returns `Some((url, binary))` when both lines are non-empty.
 /// Returns `None` for any malformed input (empty, one line, whitespace-only),
 /// which causes the caller to treat the plugin as not yet converged.
-fn parse_tarball_sentinel(content: &str) -> Option<(&str, &str)> {
+fn parse_archive_sentinel(content: &str) -> Option<(&str, &str)> {
     let mut lines = content.lines();
     let url = lines.next()?.trim();
     let binary = lines.next()?.trim();
@@ -1147,11 +1147,11 @@ mod tests {
     }
 
     #[test]
-    fn test_tarball_plugin_installs_when_sentinel_missing() {
+    fn test_archive_plugin_installs_when_sentinel_missing() {
         let mut config = client_node_config();
         config.plugin_installs.insert(
             "containerd-driver".to_string(),
-            PluginInstallConfig::Tarball {
+            PluginInstallConfig::Archive {
                 url: UrlSpec::Single("https://example.com/containerd_{arch}.tar.gz".to_string()),
                 binary: "nomad-driver-containerd".to_string(),
             },
@@ -1212,7 +1212,7 @@ mod tests {
         let mut config = client_node_config();
         config.plugin_installs.insert(
             "exec2".to_string(),
-            PluginInstallConfig::Tarball {
+            PluginInstallConfig::Archive {
                 url: UrlSpec::Single(
                     "https://releases.hashicorp.com/nomad-driver-exec2/0.1.1/nomad-driver-exec2_0.1.1_linux_amd64.zip"
                         .to_string(),
@@ -1265,13 +1265,13 @@ mod tests {
     }
 
     #[test]
-    fn test_tarball_plugin_skipped_when_already_converged() {
+    fn test_archive_plugin_skipped_when_already_converged() {
         let mut config = client_node_config();
         let url = "https://example.com/containerd_amd64.tar.gz";
         let binary = "nomad-driver-containerd";
         config.plugin_installs.insert(
             "containerd-driver".to_string(),
-            PluginInstallConfig::Tarball {
+            PluginInstallConfig::Archive {
                 url: UrlSpec::Single(url.to_string()),
                 binary: binary.to_string(),
             },
@@ -1441,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tarball_sentinel_malformed_triggers_reinstall() {
+    fn test_archive_sentinel_malformed_triggers_reinstall() {
         // Malformed sentinels (empty, one-line, garbage) must all trigger reinstall.
         let cases = [
             ("", "empty"),
@@ -1451,30 +1451,30 @@ mod tests {
         ];
         for (sentinel_content, label) in cases {
             assert!(
-                parse_tarball_sentinel(sentinel_content).is_none(),
+                parse_archive_sentinel(sentinel_content).is_none(),
                 "expected None for '{label}'"
             );
         }
     }
 
     #[test]
-    fn test_tarball_sentinel_valid_parses_correctly() {
+    fn test_archive_sentinel_valid_parses_correctly() {
         let url = "https://example.com/foo.tgz";
         let binary = "linux-amd64/nomad-driver-foo";
         let content = format!("{}\n{}", url, binary);
-        let result = parse_tarball_sentinel(&content);
+        let result = parse_archive_sentinel(&content);
         assert_eq!(result, Some((url, binary)));
     }
 
     #[test]
-    fn test_tarball_plugin_reinstalls_when_binary_not_executable() {
+    fn test_archive_plugin_reinstalls_when_binary_not_executable() {
         // Sentinel matches (2-line) and binary exists, but binary is not executable → reinstall.
         let mut config = client_node_config();
         let url = "https://example.com/containerd_amd64.tar.gz";
         let binary = "nomad-driver-containerd";
         config.plugin_installs.insert(
             "containerd-driver".to_string(),
-            PluginInstallConfig::Tarball {
+            PluginInstallConfig::Archive {
                 url: UrlSpec::Single(url.to_string()),
                 binary: binary.to_string(),
             },
@@ -1639,7 +1639,7 @@ mod tests {
         );
         config.plugin_installs.insert(
             "plugin-b".to_string(),
-            PluginInstallConfig::Tarball {
+            PluginInstallConfig::Archive {
                 url: UrlSpec::Single("https://example.com/foo.tar.gz".to_string()),
                 binary: "subdir/nomad-driver-foo".to_string(), // same basename
             },

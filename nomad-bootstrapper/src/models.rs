@@ -82,7 +82,7 @@ pub enum UrlSpec {
 /// after installation, so the install phase can place it into `plugin_dir`.
 ///
 /// ## `binary` field semantics differ by variant
-/// - **`Tarball`**: `binary` is the **exact relative path of the target executable
+/// - **`Archive`**: `binary` is the **exact relative path of the target executable
 ///   within the archive** after extraction (e.g. `"nomad-driver-containerd"` or
 ///   `"linux-amd64/nomad-driver-foo"`). The binary is moved to
 ///   `plugin_dir/<basename(binary)>`.
@@ -94,15 +94,15 @@ pub enum UrlSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "method", rename_all = "lowercase")]
 pub enum PluginInstallConfig {
-    /// Download a release tarball and extract a named binary from it.
+    /// Download a release archive and extract a named binary from it.
     ///
     /// `url` may be a single URL (with optional `{arch}` placeholder) or an arch-keyed
     /// map. Use version-pinned, immutable URLs — mutable "latest" URLs defeat idempotency.
     ///
-    /// `binary` is the path of the binary *inside* the tarball after extraction
+    /// `binary` is the path of the binary *inside* the archive after extraction
     /// (can be a bare filename or a relative path like `linux-amd64/nomad-driver-foo`).
-    Tarball { url: UrlSpec, binary: String },
-    /// Download a single binary file directly (no tarball extraction).
+    Archive { url: UrlSpec, binary: String },
+    /// Download a single binary file directly (no archive extraction).
     ///
     /// `url` may be a single URL (with optional `{arch}` placeholder) or an arch-keyed
     /// map. Use version-pinned, immutable URLs — mutable "latest" URLs defeat idempotency.

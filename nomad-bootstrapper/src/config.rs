@@ -107,7 +107,7 @@ pub struct DefaultsConfig {
     /// driver name (e.g. "containerd-driver"). A per-node `plugin_install` entry
     /// for the same driver *replaces* the default entirely (no deep merge).
     ///
-    /// For `tarball` entries the `binary` field is the **archive-internal relative
+    /// For `archive` entries the `binary` field is the **archive-internal relative
     /// path** of the executable (e.g. `"nomad-driver-containerd"` or
     /// `"linux-amd64/nomad-driver-foo"`). Use version-pinned, immutable URLs;
     /// mutable "latest" asset URLs defeat idempotency.
@@ -1452,7 +1452,7 @@ mod tests {
         let inventory: Inventory = toml::from_str(
             r#"
             [defaults.plugin_install.containerd-driver]
-            method = "tarball"
+            method = "archive"
             url = "https://example.com/containerd_{arch}.tar.gz"
             binary = "nomad-driver-containerd"
 
@@ -1469,7 +1469,7 @@ mod tests {
         let install = &nodes[0].config.plugin_installs;
         assert!(matches!(
             install.get("containerd-driver"),
-            Some(PluginInstallConfig::Tarball { url: UrlSpec::Single(url), binary })
+            Some(PluginInstallConfig::Archive { url: UrlSpec::Single(url), binary })
                 if url == "https://example.com/containerd_{arch}.tar.gz"
                 && binary == "nomad-driver-containerd"
         ));
